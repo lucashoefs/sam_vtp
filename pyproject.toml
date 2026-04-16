@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sam-vtp-core"
+version = "0.1.0"
+description = "Core SAM-VTP inference package"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+  "torch>=2.1",
+  "torchvision>=0.16",
+  "numpy>=1.24",
+  "Pillow>=10.0",
+  "hydra-core>=1.3",
+  "omegaconf>=2.3",
+  "sam-2 @ git+https://github.com/facebookresearch/sam2.git",
+]
+
+[project.scripts]
+sam-vtp-infer = "sam_vtp_core.cli:main"
+sam-vtp-smoke = "sam_vtp_core.smoke:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
