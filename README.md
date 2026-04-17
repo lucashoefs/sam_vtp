@@ -1,6 +1,6 @@
-# SAM-VTP Core
+# SAM-VTP
 
-SAM-VTP Core is an inference-first release of **SAM-VTP** (SAM Video Traversability Predictor), built for real-time traversability segmentation in robotic perception pipelines.
+SAM-VTP (SAM Video Traversability Predictor) is built for real-time traversability segmentation in robotic perception pipelines.
 
 SAM-VTP leverages SAM2's native video memory design to produce temporally consistent traversability maps from RGB streams. Rather than segmenting each frame independently, it carries compact memory across time so predictions stay stable under ego-motion, appearance shifts, and partial occlusions.
 
@@ -10,15 +10,9 @@ At a high level, SAM-VTP runs the following loop on each frame:
 3. SAM decoder predicts traversability logits/mask for the frame.
 4. Memory encoder writes updated state for the next step.
 
-This repository is intentionally deployment-oriented:
-- Core SAM-VTP model implementation.
-- Optional full-forward CUDA Graph replay for higher throughput.
-- Simple CLI and Python APIs for sequence and real-time stream inference.
-- No dataset loaders, training loops, benchmarking suites, or unrelated baselines.
-
 ## Repository Layout
 
-- `src/sam_vtp_core/model.py`: SAM-VTP core model
+- `src/sam_vtp_core/model.py`: SAM-VTP model
 - `src/sam_vtp_core/fullgraph.py`: optional full-forward CUDA graph replay runner
 - `src/sam_vtp_core/inference.py`: image-sequence utilities
 - `src/sam_vtp_core/stream.py`: real-time stream processor API (camera-agnostic)
@@ -41,7 +35,7 @@ pip install --upgrade pip
 Follow the official selector for your machine:
 https://pytorch.org/get-started/locally/
 
-### 3) Install SAM-VTP Core package (includes SAM2 dependency)
+### 3) Install SAM-VTP package (includes SAM2 dependency)
 
 ```bash
 pip install -e .
@@ -171,6 +165,5 @@ print("processed", num_processed)
 
 - Input tensors are expected in RGB with values in the `[0, 255]` range.
 - The default model config uses `num_maskmem=7`.
-- Non-aligned sizes (for example 550x688 from RUGD) are padded internally to a SAM2-compatible processing shape and logits are cropped back to the requested output size.
-- If frame size changes during a live stream, the stream processor resets temporal memory by default (`reset_on_size_change=True`).
-- This package is designed for inference-first public release.
+- Non-aligned sizes are padded internally to a SAM2-compatible processing shape and logits are cropped back to the requested output size.
+- If frame size changes during a live stream, the stream processor resets temporal memory by default (`reset_on_size_change=True`)

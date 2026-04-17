@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "sam-vtp-core"
+name = "sam-vtp"
 version = "0.1.0"
-description = "Core SAM-VTP inference package"
+description = "SAM-VTP inference package"
 readme = "README.md"
 requires-python = ">=3.8"
 dependencies = [
