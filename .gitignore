@@ -22,3 +22,6 @@ checkpoints/
 # IDE
 .vscode/
 .idea/
+
+# Checkpoints
+*.pt
