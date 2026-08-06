@@ -4,23 +4,28 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sam-vtp"
-version = "0.1.0"
-description = "SAM-VTP inference package"
+version = "0.2.0"
+description = "Temporally consistent continuous traversability prediction from video"
 readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.8"
+
+# The network is defined in-tree and needs nothing but torch. numpy and Pillow
+# are for image I/O in the inference helpers, not for the model.
 dependencies = [
-  "torch>=2.1",
-  "torchvision>=0.16",
-  "numpy>=1.24",
-  "Pillow>=10.0",
-  "hydra-core>=1.3",
-  "omegaconf>=2.3",
-  "sam-2 @ git+https://github.com/facebookresearch/sam2.git",
+  "torch>=2.0",
+  "numpy>=1.21",
+  "Pillow>=9.0",
 ]
+
+[project.optional-dependencies]
+# Only the label pipeline needs OpenCV.
+labels = ["opencv-python>=4.5"]
 
 [project.scripts]
 sam-vtp-infer = "sam_vtp_core.cli:main"
 sam-vtp-smoke = "sam_vtp_core.smoke:main"
+sam-vtp-labels = "sam_vtp_core.labels.generate:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

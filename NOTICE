@@ -1,0 +1,30 @@
+This product includes software derived from SAM 2 (Segment Anything in Images
+and Videos), Copyright (c) Meta Platforms, Inc. and affiliates, released under
+the Apache License 2.0:
+
+    https://github.com/facebookresearch/sam2
+
+`src/sam_vtp_core/architecture.py` reproduces, in condensed form, the layer
+definitions of SAM 2's Hiera image encoder, FPN neck, memory attention, memory
+encoder and mask decoder, together with the memory read/write logic of
+`SAM2Base`. Parameter names are preserved so that SAM 2 pretrained weights and
+SAM-VTP checkpoints remain loadable.
+
+Modifications relative to SAM 2:
+
+  * The interactive prompt encoder is replaced by a fixed learned prompt
+    (`LearnedPrompt`), since traversability has no user click.
+  * Memory features are resampled into the current camera frame using depth and
+    relative pose before memory attention (ego-motion warp).
+  * Depth-derived geometry channels are added to the coarsest backbone level.
+  * A full-resolution RGB-guided residual head refines the decoder's output.
+  * Interactive-tracking paths not used by SAM-VTP (click refinement, reverse
+    tracking, mask-as-output, non-overlap constraints, multi-object batching)
+    are removed.
+  * Hydra/OmegaConf configuration is replaced by a plain dataclass.
+
+A copy of the Apache License 2.0 is available at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+All other content in this repository is licensed under the terms in LICENSE.

@@ -1,7 +1,7 @@
-torch>=2.1
-torchvision>=0.16
-numpy>=1.24
-Pillow>=10.0
-hydra-core>=1.3
-omegaconf>=2.3
-sam-2 @ git+https://github.com/facebookresearch/sam2.git
+# Install PyTorch first for your CUDA build: https://pytorch.org/get-started/locally/
+torch>=2.0
+numpy>=1.21
+Pillow>=9.0
+
+# Label generation only (pip install "sam-vtp[labels]")
+# opencv-python>=4.5
