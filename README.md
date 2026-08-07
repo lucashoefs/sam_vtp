@@ -89,11 +89,19 @@ wherever you get them, as numpy arrays or tensors:
 ```python
 from sam_vtp_core import SAMVTPStreamProcessor
 
-stream = SAMVTPStreamProcessor(model, resize_hw=(512, 512), threshold=0.5)
+stream = SAMVTPStreamProcessor(model, resize_hw=(512, 512), threshold=0.5,
+                               input_fit="pad",      # see Aspect ratio below
+                               return_numpy=True)
 while (frame := grab()) is not None:
     result = stream.step(frame.rgb, depth=frame.depth, pose=frame.pose)
-    plan(result.probabilities[0, 0])
+    if result.memory_fill_level < 1.0:
+        continue                       # bank still filling, less context than trained
+    plan(result.probabilities)         # (H, W) numpy array
 ```
+
+`stream.reset()` drops temporal state and rebuilds the graph runner, so the next
+~17 frames run eagerly while the bank refills. Don't wire it to a trigger-happy
+staleness check.
 
 ---
 
@@ -105,15 +113,76 @@ and nothing downstream can detect it. Worth checking once at integration time.
 | Input | Requirement | If it's wrong |
 |---|---|---|
 | **Depth** | Planar z-depth along the optical axis, in **metres** | The geometry channels and the warp are metric. Millimetres are off by 1000x, normalised `[0,1]` depth is meaningless. |
-| **Pose** | Camera-to-world `[x y z qx qy qz qw]`, scalar-**last**, NED world frame | A scalar-first file loads fine and rotates the memory wrongly every frame. |
-| **Intrinsics** | Yours, via `CameraIntrinsics` | The default is the TartanGround simulator camera (640x640, 90 degree FOV). Wrong intrinsics tilt every slope and shift every correspondence. |
+| **Pose** | `[x y z qx qy qz qw]`, scalar-**last**, rotating **NED-body camera axes** (x forward, y right, z down) into a **consistent** world frame | A scalar-first quaternion, or FLU/optical axes passed straight through, loads fine and rotates the memory wrongly every frame. |
+| **Intrinsics** | Yours, at the resolution they were calibrated at | The default is the TartanGround simulator camera (640x640, 90 degree FOV). Wrong intrinsics tilt every slope and shift every correspondence. |
+
+**The world frame is arbitrary.** Only the relative transform between two frames
+is ever used, and that is invariant to the frame the poses are expressed in, so
+ROS `odom` is fine. There is no need to convert ENU to NED. What matters is the
+camera axis convention, and the helpers handle it:
 
 ```python
-from sam_vtp_core import CameraIntrinsics, build_model
+from sam_vtp_core import CameraIntrinsics, build_model, pose_from_optical
 
-cam = CameraIntrinsics(fx=..., fy=..., cx=..., cy=..., width=1280, height=720)
-model = build_model("sam_vtp.pt", device=dev, camera=cam)   # from factory calibration
+cam = CameraIntrinsics.from_K(camera_info.k, width=848, height=480)   # NATIVE resolution
+model = build_model("sam_vtp.pt", device=dev, camera=cam)
+model.warmup()                       # pay lazy CUDA init before the robot is live
+
+# TF: odom -> <camera>_color_optical_frame, looked up AT THE IMAGE TIMESTAMP
+tf = buffer.lookup_transform("odom", "d455_color_optical_frame", img.header.stamp)
+t, q = tf.transform.translation, tf.transform.rotation
+pose = pose_from_optical([t.x, t.y, t.z], [q.x, q.y, q.z, q.w])
 ```
+
+Use `pose_from_flu` if all you have is a REP-103 body frame, but prefer the
+optical frame: the translation must belong to the same frame as the rotation,
+and a base-link position with a camera rotation carries a lever-arm error that
+does not cancel when the robot turns.
+
+Sample the pose at the **image timestamp**, not at processing time. At 0.5 m/s,
+60 ms of skew is 3 cm, which shows up as smearing in the warped memory.
+
+For depth from an RGB-D camera:
+
+```python
+from sam_vtp_core import depth_from_uint16_mm
+
+depth_m, valid = depth_from_uint16_mm(aligned_depth_16uc1)   # 0 means no return
+result = stream.step(rgb, depth=depth_m, pose=pose, depth_valid=valid)
+```
+
+Non-positive depths are already treated as missing, so `depth_valid` is for
+evidence a threshold cannot express: the camera's own confidence, a range limit
+tighter than the model's 100 m, or a depth map whose holes have been filled with
+plausible-looking values by a post-processing filter.
+
+Align depth to the colour stream. On a D455 the two have different intrinsics
+and a baseline offset, so unaligned depth means the geometry is computed on a
+grid that does not correspond to the image.
+
+### Aspect ratio
+
+Training used a square 90x90 degree image, so `fx/W == fy/H == 0.5`: a pixel
+subtends the same angle in both axes. A 16:9 camera with `fx != fy` does not,
+and the encoder has never seen anything else. `input_fit` decides what to do
+about it, and adjusts the intrinsics to match, which is the part that is easy to
+get wrong by hand.
+
+Measured on a D455 at 848x480 (fx 424, fy 377), running at 512x512:
+
+| `input_fit` | fitted size | FOV | `fx/W`, `fy/H` | trade |
+|---|---|---|---|---|
+| `"stretch"` (default) | 848x480 | 90 x 65 | 0.500, 0.785 | whole sensor, invents nothing, but vertically magnified ~1.6x versus training |
+| `"crop"` | 540x480 | 65 x 65 | 0.785, 0.785 | isotropic, invents nothing, loses 36% of horizontal FOV |
+| `"pad"` | 848x753 | 90 x 90 | 0.500, 0.500 | isotropic **and** an exact match to training, at the cost of fabricated border content |
+
+Crop and pad target the aspect `fx:fy` rather than the output aspect; the final
+resize is then anisotropic on purpose, which is what equalises the two
+normalised focal lengths.
+
+None of the three is free, and which one wins is empirical on your camera. The
+frame-to-frame stability metric (warp *t-1* into *t*, compare with *t*) ranks
+them on your own footage without needing any labels.
 
 Set `normalization_mode` to the range your images arrive in (`"0_255"` is the
 default). `"auto"` infers it per batch and a dark frame can fool it, so pin it
@@ -271,7 +340,7 @@ src/sam_vtp_core/
   factory.py        checkpoint-driven construction (strict)
   inference.py      sequence inference, depth/pose loading
   stream.py         camera-agnostic streaming loop
-  fullgraph.py      optional CUDA-graph replay (RGB-only models)
+  fullgraph.py      optional CUDA-graph replay of the full forward pass
   cli.py, smoke.py  entry points
   labels/
     taxonomy.py     class name -> absolute traversability
@@ -283,10 +352,10 @@ scripts/
 ```
 
 `fullgraph.py` is a second implementation of the forward pass, written over
-tensorised state so it can be captured as a CUDA graph. It only covers RGB-only
-models: the warp reads a variable set of stored poses, which isn't constant
-control flow, so a geometry checkpoint turns graph mode off rather than
-silently running unwarped. Since it duplicates the forward pass, run
+tensorised state so it can be captured as a CUDA graph. The bank, the stored
+poses and the frame counter all become fixed tensors, so once the bank is full
+the control flow is constant and the geometry encoder and ego-motion warp are
+captured along with everything else. Since it duplicates the forward pass, run
 `verify_fullgraph_parity.py` after touching `architecture.py`.
 
 ---

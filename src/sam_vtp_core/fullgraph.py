@@ -3,23 +3,28 @@
 Rationale
 ---------
 SAM-VTP is launch-bound at inference: the per-frame work is many small kernels,
-so on a fast GPU the Python and launch overhead is a large share of the frame
-time. Capturing the forward pass once and replaying it removes that overhead.
+so on a fast GPU (and even more so on an embedded one, where the CPU issuing the
+launches is weak) the launch overhead is a large share of frame time. Capturing
+the forward pass once and replaying it removes that overhead.
 
 The obstacle is that the model is recurrent through a Python dict, which a graph
 cannot walk. So this runner mirrors the memory read path over *fixed tensors*:
-the bank becomes a stacked tensor, eviction becomes a shift-and-copy, and the
-frame counter becomes a device scalar. Once the bank is full, the control flow
-is constant and the whole pass is capturable.
+the bank becomes a stacked tensor, eviction becomes a shift-and-copy, the frame
+counter becomes a device scalar, and the stored per-frame poses become another
+stacked tensor. Once the bank is full the control flow is constant and the whole
+pass is capturable, geometry and ego-motion warp included.
+
+Everything the geometry path does is fixed-shape given a fixed input size: the
+derived channels are interpolate, median, meshgrid, cross product and two box
+convolutions, and the warp is a single `grid_sample` over a constant 7-fold
+batch. The current frame's depth and pose are static input buffers, exactly like
+the image.
 
 Limitations
 -----------
-  * RGB-only models. The ego-motion warp reads a variable set of stored poses
-    and resamples against the current depth, which is not constant control
-    flow, so a geometry checkpoint disables graph mode rather than running
-    unwarped. That is the released configuration, so in practice this path
-    serves ablations and SAM-TP-style baselines.
-  * `memory_write_every > 1` disables it too: the capture bakes in the write.
+  * `memory_write_every > 1` disables it: the capture bakes in the write.
+  * The bank must be full before capture, which `min_history_frames` enforces.
+    Warmup frames run eagerly.
   * This is a second implementation of the forward pass. Run
     `scripts/verify_fullgraph_parity.py` after changing `architecture.py`.
 """
@@ -32,17 +37,27 @@ from typing import Dict, Optional
 import torch
 import torch.nn.functional as F
 
-from .architecture import SAMVTP, get_1d_sine_pe
+from .architecture import (
+    SAMVTP,
+    downsample_depth,
+    geometry_channels,
+    get_1d_sine_pe,
+    warp_features,
+)
 
 
 @dataclass
 class _TensorState:
-    cond_maskmem_features: torch.Tensor
-    cond_maskmem_pos_enc: torch.Tensor
-    cond_obj_ptr: torch.Tensor
-    non_cond_maskmem_features: torch.Tensor
-    non_cond_maskmem_pos_enc: torch.Tensor
-    non_cond_obj_ptr: torch.Tensor
+    """The recurrent state, as fixed-shape tensors a graph can update in place."""
+
+    cond_maskmem_features: torch.Tensor      # (B, mem_dim, Hm, Wm)
+    cond_maskmem_pos_enc: torch.Tensor       # (B, mem_dim, Hm, Wm)
+    cond_obj_ptr: torch.Tensor               # (B, C)
+    cond_pose: torch.Tensor                  # (B, 7)
+    non_cond_maskmem_features: torch.Tensor  # (k, B, mem_dim, Hm, Wm)
+    non_cond_maskmem_pos_enc: torch.Tensor   # (k, B, mem_dim, Hm, Wm)
+    non_cond_obj_ptr: torch.Tensor           # (k, B, C)
+    non_cond_pose: torch.Tensor              # (k, B, 7)
     step_idx: torch.Tensor
 
 
@@ -56,9 +71,8 @@ class SAMVTPFullGraphReplayRunner:
         self.enabled = (bool(enabled) and device.type == "cuda"
                         and hasattr(torch.cuda, "CUDAGraph"))
 
-        self._geometry_conflict = bool(model.needs_geometry)
         self._cadence_conflict = int(getattr(model, "memory_write_every", 1)) > 1
-        if self.enabled and (self._geometry_conflict or self._cadence_conflict):
+        if self.enabled and self._cadence_conflict:
             self.enabled = False
 
         self.capture_warmup = max(0, int(capture_warmup))
@@ -79,6 +93,9 @@ class SAMVTPFullGraphReplayRunner:
         self._graph = None
         self._state: Optional[_TensorState] = None
         self._static_input: Optional[torch.Tensor] = None
+        self._static_depth: Optional[torch.Tensor] = None
+        self._static_pose: Optional[torch.Tensor] = None
+        self._static_valid: Optional[torch.Tensor] = None
         self._static_output: Optional[Dict[str, torch.Tensor]] = None
 
         self._k = max(0, int(model.num_maskmem) - 1)
@@ -87,9 +104,6 @@ class SAMVTPFullGraphReplayRunner:
 
     def status_note(self) -> str:
         if not self.enabled:
-            if self._geometry_conflict:
-                return ("CUDA Graph disabled (ego-motion warp / geometry input need "
-                        "eager control flow)")
             if self._cadence_conflict:
                 return (f"CUDA Graph disabled (memory_write_every="
                         f"{self.model.memory_write_every} needs eager control flow)")
@@ -97,7 +111,13 @@ class SAMVTPFullGraphReplayRunner:
         if self._capture_failed:
             return f"CUDA Graph fell back to eager (capture failed: {self._capture_error})"
         if self._captured:
-            return "CUDA Graph replay active (full forward, in-graph state update)"
+            extra = []
+            if self.model.warp_memory:
+                extra.append("warp")
+            if self.model.use_geometry:
+                extra.append("geometry")
+            suffix = f", {' + '.join(extra)} in graph" if extra else ""
+            return f"CUDA Graph replay active (full forward{suffix})"
         return "CUDA Graph enabled (history warmup / capture pending)"
 
     @staticmethod
@@ -109,39 +129,89 @@ class SAMVTPFullGraphReplayRunner:
 
     # -- state ---------------------------------------------------------------
     def _sync_tensor_state_from_model(self) -> bool:
+        """Copy the model's dict-based memory into fixed tensors.
+
+        Returns False until the bank is full, and (when the model warps) until
+        every slot carries the pose it was observed from.
+        """
         cond = self.model.output_dict.get("cond_frame_outputs", {})
         non_cond = self.model.output_dict.get("non_cond_frame_outputs", {})
         if (0 not in cond) or (self._k > 0 and len(non_cond) < self._k):
             return False
 
+        needs_pose = bool(self.model.warp_memory)
         c = cond[0]
+        if needs_pose and c.get("pose") is None:
+            return False
+
         cond_feats = c["maskmem_features"].to(self.device)
         cond_pos = c["maskmem_pos_enc"][-1].to(self.device)
         cond_ptr = c["obj_ptr"].to(self.device)
+        cond_pose = (c["pose"].to(self.device) if needs_pose
+                     else cond_ptr.new_zeros(cond_ptr.shape[0], 7))
 
         if self._k > 0:
             items = sorted(non_cond.items(), key=lambda kv: kv[0])[-self._k :]
+            if needs_pose and any(it[1].get("pose") is None for it in items):
+                return False
             nc_feats = torch.stack([it[1]["maskmem_features"].to(self.device) for it in items], 0)
             nc_pos = torch.stack([it[1]["maskmem_pos_enc"][-1].to(self.device) for it in items], 0)
             nc_ptr = torch.stack([it[1]["obj_ptr"].to(self.device) for it in items], 0)
+            nc_pose = (torch.stack([it[1]["pose"].to(self.device) for it in items], 0)
+                       if needs_pose else nc_ptr.new_zeros(self._k, *cond_pose.shape))
         else:
             nc_feats = cond_feats.new_zeros((0, *cond_feats.shape))
             nc_pos = cond_pos.new_zeros((0, *cond_pos.shape))
             nc_ptr = cond_ptr.new_zeros((0, *cond_ptr.shape))
+            nc_pose = cond_pose.new_zeros((0, *cond_pose.shape))
 
         self._state = _TensorState(
             cond_maskmem_features=cond_feats,
             cond_maskmem_pos_enc=cond_pos,
             cond_obj_ptr=cond_ptr,
+            cond_pose=cond_pose,
             non_cond_maskmem_features=nc_feats,
             non_cond_maskmem_pos_enc=nc_pos,
             non_cond_obj_ptr=nc_ptr,
+            non_cond_pose=nc_pose,
             step_idx=torch.tensor(float(self.model.frame_idx), device=self.device,
                                   dtype=torch.float32),
         )
         return True
 
     # -- forward -------------------------------------------------------------
+    def _warped_bank(self, feat_size) -> torch.Tensor:
+        """Every stored feature map resampled into the current camera frame.
+
+        Returns (1 + k, B, mem_dim, Hm, Wm), conditioning slot first, matching
+        the order `_memory_conditioned_pix_feat` consumes. All slots share the
+        current depth and pose and differ only in their own stored pose, so the
+        whole bank warps in one `grid_sample` over a constant batch.
+        """
+        s = self._state
+        feats = torch.cat([s.cond_maskmem_features.unsqueeze(0),
+                           s.non_cond_maskmem_features], dim=0)      # (S, B, Cm, Hm, Wm)
+        poses = torch.cat([s.cond_pose.unsqueeze(0), s.non_cond_pose], dim=0)  # (S, B, 7)
+        S, B = feats.shape[0], feats.shape[1]
+
+        depth = downsample_depth(self._static_depth, tuple(feat_size))
+        # reshape puts slot s, batch b at index s*B + b, and repeat(S, ...) lays
+        # the current depth and pose out in exactly that order.
+        flat = feats.reshape(S * B, *feats.shape[2:])
+        warped, valid = warp_features(
+            flat.float(),
+            depth.float().repeat(S, 1, 1, 1),
+            self._static_pose.float().repeat(S, 1),
+            poses.reshape(S * B, 7).float(),
+            mode=self.model.warp_mode, cam=self.model.camera,
+            depth_valid=None if self._static_valid is None else
+            downsample_depth(self._static_valid.float(), tuple(feat_size)).repeat(S, 1, 1, 1))
+
+        warped = warped.to(feats.dtype)
+        valid = valid.to(feats.dtype)
+        blended = warped * valid + self.model.no_corr_embed.to(feats.dtype) * (1.0 - valid)
+        return blended.reshape(S, B, *feats.shape[2:])
+
     def _memory_conditioned_pix_feat(self, vision_feats, vision_pos_embeds, feat_sizes):
         assert self._state is not None
         core = self.model.sam2_model
@@ -150,12 +220,18 @@ class SAMVTPFullGraphReplayRunner:
         H, W = feat_sizes[-1]
         s = self._state
 
-        to_cat = [s.cond_maskmem_features.flatten(2).permute(2, 0, 1)]
+        if self.model.warp_memory and self._static_depth is not None:
+            bank = self._warped_bank(feat_sizes[-1])
+            cond_feat, non_cond_feat = bank[0], bank[1:]
+        else:
+            cond_feat, non_cond_feat = s.cond_maskmem_features, s.non_cond_maskmem_features
+
+        to_cat = [cond_feat.flatten(2).permute(2, 0, 1)]
         to_cat_pos = [s.cond_maskmem_pos_enc.flatten(2).permute(2, 0, 1)
                       + core.maskmem_tpos_enc[self.model.num_maskmem - 1]]
         for t_pos in range(1, self.model.num_maskmem):
             slot = t_pos - 1
-            to_cat.append(s.non_cond_maskmem_features[slot].flatten(2).permute(2, 0, 1))
+            to_cat.append(non_cond_feat[slot].flatten(2).permute(2, 0, 1))
             to_cat_pos.append(s.non_cond_maskmem_pos_enc[slot].flatten(2).permute(2, 0, 1)
                               + core.maskmem_tpos_enc[self.model.num_maskmem - t_pos - 1])
 
@@ -186,8 +262,16 @@ class SAMVTPFullGraphReplayRunner:
         image_norm = model.normalize_imagenet(frame)
 
         backbone_out = core.forward_image(image_norm)
-        vision_feats, vision_pos_embeds, feat_sizes = core.prepare_backbone_features(backbone_out)
+        if model.use_geometry and self._static_depth is not None:
+            top = backbone_out["backbone_fpn"][-1]
+            geo = geometry_channels(self._static_depth,
+                                    out_hw=(model.geometry_hw, model.geometry_hw),
+                                    cam=model.camera, depth_valid=self._static_valid)
+            backbone_out["backbone_fpn"] = list(backbone_out["backbone_fpn"])
+            backbone_out["backbone_fpn"][-1] = top + model.geometry_encoder(
+                geo.to(top.dtype), top.shape[-2:])
 
+        vision_feats, vision_pos_embeds, feat_sizes = core.prepare_backbone_features(backbone_out)
         pix_feat = self._memory_conditioned_pix_feat(vision_feats, vision_pos_embeds, feat_sizes)
 
         sparse, dense = core.sam_prompt_encoder(points=None, boxes=None, masks=None)
@@ -243,22 +327,36 @@ class SAMVTPFullGraphReplayRunner:
             s.non_cond_maskmem_features[-1].copy_(maskmem_features)
             s.non_cond_maskmem_pos_enc[-1].copy_(maskmem_pos_enc[-1])
             s.non_cond_obj_ptr[-1].copy_(obj_ptr)
+            if self.model.warp_memory:
+                # The slot stores the pose it was observed from, so a later
+                # frame can warp it into its own view.
+                s.non_cond_pose[:-1].copy_(s.non_cond_pose[1:].clone())
+                s.non_cond_pose[-1].copy_(self._static_pose)
         self._state.step_idx.add_(1.0)
 
         return {"logits": mask_logits}
 
     # -- capture -------------------------------------------------------------
-    def _capture(self, frame: torch.Tensor) -> None:
+    def _capture(self, frame: torch.Tensor, depth: Optional[torch.Tensor],
+                 pose: Optional[torch.Tensor],
+                 depth_valid: Optional[torch.Tensor]) -> None:
         s = self._state
         assert s is not None
         snap = (s.non_cond_maskmem_features.clone(), s.non_cond_maskmem_pos_enc.clone(),
-                s.non_cond_obj_ptr.clone(), s.step_idx.clone())
+                s.non_cond_obj_ptr.clone(), s.non_cond_pose.clone(), s.step_idx.clone())
 
         self._static_input = torch.empty_like(frame)
+        self._static_depth = torch.empty_like(depth) if depth is not None else None
+        self._static_pose = torch.empty_like(pose) if pose is not None else None
+        self._static_valid = (torch.empty_like(depth_valid, dtype=torch.float32)
+                              if depth_valid is not None else None)
+
         capture_stream = torch.cuda.Stream(device=self.device)
         torch.cuda.synchronize(self.device)
         with torch.cuda.stream(capture_stream):
-            self._static_input.copy_(frame)
+            self._copy_inputs(frame, depth, pose, depth_valid)
+            # Warmup populates the position-encoding and RoPE caches, which would
+            # otherwise be built (and stored in Python dicts) mid-capture.
             for _ in range(self.capture_warmup):
                 self._forward_tensorized_state(self._static_input)
             self._graph = torch.cuda.CUDAGraph()
@@ -269,20 +367,32 @@ class SAMVTPFullGraphReplayRunner:
         s.non_cond_maskmem_features.copy_(snap[0])
         s.non_cond_maskmem_pos_enc.copy_(snap[1])
         s.non_cond_obj_ptr.copy_(snap[2])
-        s.step_idx.copy_(snap[3])
+        s.non_cond_pose.copy_(snap[3])
+        s.step_idx.copy_(snap[4])
         self._captured = True
 
+    def _copy_inputs(self, frame, depth, pose, depth_valid) -> None:
+        self._static_input.copy_(frame)
+        if self._static_depth is not None and depth is not None:
+            self._static_depth.copy_(depth)
+        if self._static_pose is not None and pose is not None:
+            self._static_pose.copy_(pose)
+        if self._static_valid is not None and depth_valid is not None:
+            self._static_valid.copy_(depth_valid.float())
+
     def run(self, frame: torch.Tensor, is_init_frame: bool, update_memory: bool = True,
-            depth: Optional[torch.Tensor] = None, pose: Optional[torch.Tensor] = None):
+            depth: Optional[torch.Tensor] = None, pose: Optional[torch.Tensor] = None,
+            depth_valid: Optional[torch.Tensor] = None):
         """Run one frame, replaying the captured graph when possible.
 
-        `update_memory=False` is honoured only on the eager path -- a captured
-        graph has the write baked into its control flow. The constructor already
-        disables graph mode when the model carries a write cadence.
+        `update_memory=False` is honoured only on the eager path, since a
+        captured graph has the write baked into its control flow. The
+        constructor already disables graph mode when the model carries a write
+        cadence.
         """
         eager = lambda: self.model.forward_frame(  # noqa: E731
             frame, is_init_frame=is_init_frame, update_memory=update_memory,
-            depth=depth, pose=pose)
+            depth=depth, pose=pose, depth_valid=depth_valid)
 
         if (not self.enabled) or self._capture_failed:
             return eager()
@@ -295,7 +405,7 @@ class SAMVTPFullGraphReplayRunner:
 
         if not self._captured:
             try:
-                self._capture(frame)
+                self._capture(frame, depth, pose, depth_valid)
             except Exception as exc:
                 self._capture_failed = True
                 self._capture_error = f"{type(exc).__name__}: {exc}"
@@ -305,6 +415,6 @@ class SAMVTPFullGraphReplayRunner:
                     pass
                 return eager()
 
-        self._static_input.copy_(frame)
+        self._copy_inputs(frame, depth, pose, depth_valid)
         self._graph.replay()
         return self._static_output

@@ -40,7 +40,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--amp", choices=["fp16", "fp32"], default="fp16")
 
     p.add_argument("--use-fullgraph", dest="use_fullgraph", action="store_true", default=None,
-                   help="CUDA graph replay (RGB-only models); default on when CUDA is available")
+                   help="CUDA graph replay of the full forward pass; default on when CUDA is available")
     p.add_argument("--no-fullgraph", dest="use_fullgraph", action="store_false")
     p.add_argument("--capture-warmup", type=int, default=0)
     p.add_argument("--fullgraph-min-history", type=int, default=16)

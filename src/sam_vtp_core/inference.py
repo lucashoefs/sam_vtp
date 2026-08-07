@@ -127,6 +127,22 @@ def read_depth_metres(path: Path, scale: float = 1.0, packed_bgra: bool = True) 
     return arr.astype(np.float32) * float(scale)
 
 
+def depth_from_uint16_mm(arr, scale: float = 0.001):
+    """RealSense-style `16UC1` millimetres to float32 metres, plus a validity mask.
+
+    Zero means "no return", not "zero distance", so it is reported as invalid
+    rather than as a surface pressed against the lens. Stereo holes are routine
+    on specular floors, low-texture surfaces and past the camera's usable range.
+
+    Returns:
+        (depth_metres, valid) as float32 and bool arrays of the input shape,
+        ready for `forward_frame(depth=..., depth_valid=...)`.
+    """
+    a = np.asarray(arr)
+    valid = a > 0
+    return a.astype(np.float32) * float(scale), valid
+
+
 def load_depth_tensor(path: Path, scale: float = 1.0,
                       resize_hw: Optional[Tuple[int, int]] = None,
                       packed_bgra: bool = True) -> torch.Tensor:

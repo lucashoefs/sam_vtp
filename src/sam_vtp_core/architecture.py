@@ -1136,6 +1136,31 @@ class CameraIntrinsics:
         fy = 0.5 * height / math.tan(math.radians(vfov_deg) / 2.0)
         return cls(fx, fy, 0.5 * width - 0.5, 0.5 * height - 0.5, width, height)
 
+    @classmethod
+    def from_K(cls, K, width: int, height: int):
+        """From a row-major 3x3 `K`, e.g. `sensor_msgs/CameraInfo.k`.
+
+        `width` and `height` must be the resolution `K` was calibrated at, not
+        the resolution you feed the model. Resizing is handled by `scaled`.
+        """
+        K = list(K)
+        if len(K) != 9:
+            raise ValueError(f"K must have 9 elements, got {len(K)}")
+        return cls(fx=K[0], fy=K[4], cx=K[2], cy=K[5], width=width, height=height)
+
+    def crop(self, x0: int, y0: int, width: int, height: int) -> "CameraIntrinsics":
+        """Intrinsics for a crop starting at (x0, y0). Focal lengths are unchanged."""
+        return CameraIntrinsics(self.fx, self.fy, self.cx - x0, self.cy - y0, width, height)
+
+    def pad(self, left: int, top: int, width: int, height: int) -> "CameraIntrinsics":
+        """Intrinsics for an image padded by (left, top) into a (width, height) canvas."""
+        return CameraIntrinsics(self.fx, self.fy, self.cx + left, self.cy + top, width, height)
+
+    def fov_deg(self) -> Tuple[float, float]:
+        """(horizontal, vertical) field of view, for comparing against training."""
+        return (2.0 * math.degrees(math.atan(0.5 * self.width / self.fx)),
+                2.0 * math.degrees(math.atan(0.5 * self.height / self.fy)))
+
     def scaled(self, h: int, w: int) -> Tuple[float, float, float, float]:
         """Intrinsics rescaled to an (h, w) grid, pixel-centre convention.
 
@@ -1155,7 +1180,30 @@ TARTANGROUND = CameraIntrinsics(NATIVE_HW / 2.0, NATIVE_HW / 2.0,
                                 NATIVE_HW / 2.0, NATIVE_HW / 2.0, NATIVE_HW, NATIVE_HW)
 
 # Optical (x right, y down, z forward) -> NED body (x forward, y right, z down).
+#
+# Set this to the identity if you feed the camera optical frame's own pose
+# instead of the platform body pose, which is the simplest thing to do from a
+# ROS TF tree. Only the relative transform between two frames is ever used, and
+# that is invariant to the world frame the poses are expressed in, so the body
+# convention is the only axis choice that matters.
 _R_OPT2NED = torch.tensor([[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+
+_R_OPT2NED_CACHE: Dict[Any, torch.Tensor] = {}
+
+
+def _opt2ned(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """`_R_OPT2NED` on the requested device, cached.
+
+    Copying it per call would be a host-to-device transfer from pageable memory,
+    which is a synchronising operation and cannot be captured in a CUDA graph.
+    The cache is filled on the first call, so warm up before capturing.
+    """
+    key = (str(device), dtype)
+    m = _R_OPT2NED_CACHE.get(key)
+    if m is None:
+        m = _R_OPT2NED.to(device=device, dtype=dtype)
+        _R_OPT2NED_CACHE[key] = m
+    return m
 
 
 def quat_to_rotmat(q: torch.Tensor) -> torch.Tensor:
@@ -1172,13 +1220,77 @@ def quat_to_rotmat(q: torch.Tensor) -> torch.Tensor:
     ], dim=-1).reshape(*q.shape[:-1], 3, 3)
 
 
+def quat_mul(a, b) -> torch.Tensor:
+    """Hamilton product of two scalar-last quaternions."""
+    a = torch.as_tensor(a, dtype=torch.float32).reshape(-1, 4)
+    b = torch.as_tensor(b, dtype=torch.float32).reshape(-1, 4)
+    ax, ay, az, aw = a.unbind(-1)
+    bx, by, bz, bw = b.unbind(-1)
+    return torch.stack([aw * bx + ax * bw + ay * bz - az * by,
+                        aw * by - ax * bz + ay * bw + az * bx,
+                        aw * bz + ax * by - ay * bx + az * bw,
+                        aw * bw - ax * bx - ay * by - az * bz], dim=-1)
+
+
+# Right-multiplier taking a world-to-camera-OPTICAL rotation to the world-to-
+# NED-body rotation the model expects. Optical axes are x right, y down,
+# z forward; NED body is x forward, y right, z down.
+Q_OPTICAL_TO_NED_BODY = (-0.5, -0.5, -0.5, 0.5)
+
+# Same, from a ROS REP-103 body frame (x forward, y left, z up), which differs
+# from NED body by 180 degrees about x.
+Q_FLU_TO_NED_BODY = (1.0, 0.0, 0.0, 0.0)
+
+
+def pose_from_optical(translation, quaternion_xyzw) -> torch.Tensor:
+    """Model pose from the pose of the camera's OPTICAL frame.
+
+    This is the easy path from a ROS TF tree: look up `odom` to
+    `<camera>_color_optical_frame` at the image timestamp and pass its
+    translation and rotation straight in.
+
+    The world frame does not have to be NED. Only the relative transform
+    between two frames is ever used, and that is invariant to the world frame,
+    so any fixed right-handed frame works as long as every pose in a sequence
+    uses the same one. What must be right is the camera axis convention, which
+    is what this function fixes.
+
+    `translation` must be the position of the same frame whose rotation you
+    give. Using the base-link position with the camera's rotation introduces a
+    lever-arm error that does not cancel when the robot turns.
+
+    Args:
+        translation: (3,) or (B, 3) position of the optical frame in the world.
+        quaternion_xyzw: (4,) or (B, 4) world-from-optical rotation, scalar-last.
+
+    Returns:
+        (B, 7) `[x y z qx qy qz qw]` ready for `forward_frame(pose=...)`.
+    """
+    t = torch.as_tensor(translation, dtype=torch.float32).reshape(-1, 3)
+    q = quat_mul(quaternion_xyzw, Q_OPTICAL_TO_NED_BODY)
+    return torch.cat([t, q.reshape(-1, 4)], dim=-1)
+
+
+def pose_from_flu(translation, quaternion_xyzw) -> torch.Tensor:
+    """Model pose from a ROS REP-103 body frame (x forward, y left, z up).
+
+    See `pose_from_optical` for the world-frame and lever-arm caveats; the
+    latter bites harder here, since an FLU frame is usually the robot base
+    rather than the camera. Prefer `pose_from_optical` when TF can give you the
+    optical frame directly.
+    """
+    t = torch.as_tensor(translation, dtype=torch.float32).reshape(-1, 3)
+    q = quat_mul(quaternion_xyzw, Q_FLU_TO_NED_BODY)
+    return torch.cat([t, q.reshape(-1, 4)], dim=-1)
+
+
 def relative_optical_transform(pose_cur: torch.Tensor, pose_mem: torch.Tensor):
     """Rigid transform taking current-frame optical coordinates into a past frame.
 
     Poses are camera-to-world `[x y z qx qy qz qw]` in a NED world frame.
     Returns (A, b) with `X_mem = A @ X_cur + b` in optical coordinates.
     """
-    P = _R_OPT2NED.to(pose_cur.device, pose_cur.dtype)
+    P = _opt2ned(pose_cur.device, pose_cur.dtype)
     Pt = P.transpose(-1, -2)
     R_cur = quat_to_rotmat(pose_cur[..., 3:])
     R_mem = quat_to_rotmat(pose_mem[..., 3:])
@@ -1190,7 +1302,8 @@ def relative_optical_transform(pose_cur: torch.Tensor, pose_mem: torch.Tensor):
 
 def build_warp_grid(depth_cur: torch.Tensor, pose_cur: torch.Tensor, pose_mem: torch.Tensor,
                     min_depth: float = 0.1, max_depth: float = 200.0,
-                    cam: CameraIntrinsics = TARTANGROUND):
+                    cam: CameraIntrinsics = TARTANGROUND,
+                    depth_valid: Optional[torch.Tensor] = None):
     """Grid mapping each current-frame cell to where that 3D point was seen before.
 
     Backward warping: the grid is built by unprojecting the *current* frame and
@@ -1214,6 +1327,8 @@ def build_warp_grid(depth_cur: torch.Tensor, pose_cur: torch.Tensor, pose_mem: t
 
     z = depth_cur[:, 0].clamp(min_depth, max_depth)
     finite = torch.isfinite(depth_cur[:, 0]) & (depth_cur[:, 0] > min_depth)
+    if depth_valid is not None:
+        finite = finite & depth_valid.reshape(B, H, W).bool()
     x = (us - cx) * z / fx
     y = (vs - cy) * z / fy
     pts = torch.stack([x, y, z], dim=-1).reshape(B, -1, 3)
@@ -1243,9 +1358,11 @@ def build_warp_grid(depth_cur: torch.Tensor, pose_cur: torch.Tensor, pose_mem: t
 
 def warp_features(feat_mem: torch.Tensor, depth_cur: torch.Tensor,
                   pose_cur: torch.Tensor, pose_mem: torch.Tensor,
-                  mode: str = "bilinear", cam: CameraIntrinsics = TARTANGROUND):
+                  mode: str = "bilinear", cam: CameraIntrinsics = TARTANGROUND,
+                  depth_valid: Optional[torch.Tensor] = None):
     """Resample a past frame's features onto the current frame's grid."""
-    grid, valid = build_warp_grid(depth_cur, pose_cur, pose_mem, cam=cam)
+    grid, valid = build_warp_grid(depth_cur, pose_cur, pose_mem, cam=cam,
+                                  depth_valid=depth_valid)
     warped = F.grid_sample(feat_mem, grid.to(feat_mem.dtype), mode=mode,
                            padding_mode="zeros", align_corners=False)
     return warped, valid.to(warped.dtype)
@@ -1283,7 +1400,8 @@ def _median3(x: torch.Tensor) -> torch.Tensor:
 
 def geometry_channels(depth: torch.Tensor, out_hw: Tuple[int, int] = (256, 256),
                       min_depth: float = 0.0, max_depth: float = 100.0,
-                      cam: CameraIntrinsics = TARTANGROUND) -> torch.Tensor:
+                      cam: CameraIntrinsics = TARTANGROUND,
+                      depth_valid: Optional[torch.Tensor] = None) -> torch.Tensor:
     """Derive the label function's own geometric arguments from metric depth.
 
     The supervision is built as `semantic_prior x slope_factor x roughness_factor
@@ -1300,6 +1418,11 @@ def geometry_channels(depth: torch.Tensor, out_hw: Tuple[int, int] = (256, 256),
             produces meaningless geometry, silently.
         out_hw: resolution to compute at. 256 is well above the stride-4 decoder
             and the smoothing the label applies, at a sixteenth the cost of 512.
+        depth_valid: optional (N, 1, H, W) mask, ANDed with the range test.
+            A stereo camera's own confidence, or a range limit tighter than
+            `max_depth`, is better evidence than a threshold on the value: a
+            hole-filled or spatially-filtered depth map reports plausible
+            numbers where it has no measurement.
 
     Returns:
         (N, 5, h, w): log depth, slope, roughness, height below optical centre,
@@ -1314,6 +1437,11 @@ def geometry_channels(depth: torch.Tensor, out_hw: Tuple[int, int] = (256, 256),
     # the roughness window sky pixels at ~2000 m and inflate it by two orders
     # of magnitude.
     valid = torch.isfinite(depth) & (depth > min_depth) & (depth <= max_depth)
+    if depth_valid is not None:
+        dv = depth_valid.to(depth.device)
+        if dv.shape[-2:] != out_hw:
+            dv = F.interpolate(dv.float(), size=out_hw, mode="nearest-exact")
+        valid = valid & dv.bool()
     z_raw = torch.where(valid, depth, torch.full_like(depth, max_depth))
 
     fx, fy, cx, cy = cam.scaled(h, w)
@@ -1525,6 +1653,46 @@ class SAMVTP(nn.Module):
         """True when depth and pose are required for the model to behave as trained."""
         return bool(self.warp_memory or self.use_geometry)
 
+    @property
+    def memory_fill_level(self) -> float:
+        """Fraction of the memory bank that holds real frames, in [0, 1].
+
+        Predictions before the bank is full are made from less temporal context
+        than the model was trained with. A consumer can gate planning on this
+        rather than trusting the first frames of a stream.
+        """
+        n = (len(self.output_dict["cond_frame_outputs"])
+             + len(self.output_dict["non_cond_frame_outputs"]))
+        return min(1.0, n / max(1, self.num_maskmem))
+
+    @torch.no_grad()
+    def warmup(self, n: int = 3, hw: Tuple[int, int] = (512, 512)) -> None:
+        """Run synthetic frames to pay lazy initialisation cost off the clock.
+
+        The first inference allocates cuDNN workspaces, chooses convolution
+        algorithms and fills the position-encoding and rotary caches, which
+        together cost far more than a steady-state frame. Call this after
+        loading and before the first real frame, or the robot pays it live.
+
+        Resets memory afterwards, so the bank does not start full of noise.
+        """
+        device = next(self.parameters()).device
+        dtype = next(self.parameters()).dtype
+        image = torch.zeros(1, 3, int(hw[0]), int(hw[1]), device=device, dtype=dtype)
+        depth = pose = None
+        if self.needs_geometry:
+            depth = torch.full((1, 1, int(hw[0]), int(hw[1])), 5.0,
+                               device=device, dtype=dtype)
+            pose = torch.zeros(1, 7, device=device, dtype=dtype)
+            pose[0, 6] = 1.0
+        was_training = self.training
+        self.eval()
+        for i in range(max(1, int(n))):
+            self.forward_frame(image, is_init_frame=(i == 0), depth=depth, pose=pose)
+        self.reset_memory()
+        if was_training:
+            self.train()
+
     def normalize_imagenet(self, image: torch.Tensor) -> torch.Tensor:
         mode = self.input_normalization_mode
         if mode == "0_255":
@@ -1544,7 +1712,8 @@ class SAMVTP(nn.Module):
 
     # -- geometry-aware memory read -----------------------------------------
     def _warped_output_dict(self, depth_feat: torch.Tensor, pose: torch.Tensor,
-                            feat_size: Tuple[int, int]) -> Dict[str, Any]:
+                            feat_size: Tuple[int, int],
+                            depth_valid: Optional[torch.Tensor] = None) -> Dict[str, Any]:
         """A shadow of the memory store with features aligned to the current pose.
 
         Entries whose pose was never recorded pass through unwarped rather than
@@ -1555,6 +1724,9 @@ class SAMVTP(nn.Module):
         depth = depth_feat
         if depth.shape[-2:] != tuple(feat_size):
             depth = downsample_depth(depth, tuple(feat_size))
+        dv = depth_valid
+        if dv is not None and dv.shape[-2:] != tuple(feat_size):
+            dv = downsample_depth(dv.float(), tuple(feat_size))
 
         # All entries share the current depth and pose and differ only in their
         # own pose, so N separate grid_sample launches do identical work to one
@@ -1578,7 +1750,8 @@ class SAMVTP(nn.Module):
                 warped_all, valid_all = warp_features(
                     feats, depth.float().repeat(n, 1, 1, 1),
                     pose.float().repeat(n, 1), poses_mem,
-                    mode=self.warp_mode, cam=self.camera)
+                    mode=self.warp_mode, cam=self.camera,
+                    depth_valid=None if dv is None else dv.repeat(n, 1, 1, 1))
 
             cursor = 0
             for bucket, idx, entry in todo:
@@ -1608,6 +1781,7 @@ class SAMVTP(nn.Module):
         update_memory: bool = True,
         depth: Optional[torch.Tensor] = None,
         pose: Optional[torch.Tensor] = None,
+        depth_valid: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """Predict one frame and, unless gated, write it into memory.
 
@@ -1617,7 +1791,13 @@ class SAMVTP(nn.Module):
             is_init_frame: treat this frame as the conditioning frame.
             update_memory: emit a prediction without writing to the bank.
             depth: (B, 1, H, W) metric planar z-depth in metres.
-            pose:  (B, 7) camera-to-world `[x y z qx qy qz qw]`, NED.
+            pose:  (B, 7) camera-to-world `[x y z qx qy qz qw]`. See
+                `pose_from_optical` for building this from a ROS TF lookup;
+                the world frame is arbitrary, the camera axes are not.
+            depth_valid: optional (B, 1, H, W) mask. Non-positive depths are
+                already treated as missing, so this is for evidence a threshold
+                cannot express: the camera's own confidence, a range limit, or
+                a depth map whose holes have been filled with plausible values.
 
         Raises:
             ValueError: if the model was trained with geometry but depth or pose
@@ -1642,7 +1822,7 @@ class SAMVTP(nn.Module):
             # single insertion point.
             top = backbone_out["backbone_fpn"][-1]
             geo = geometry_channels(depth, out_hw=(self.geometry_hw, self.geometry_hw),
-                                    cam=self.camera)
+                                    cam=self.camera, depth_valid=depth_valid)
             backbone_out["backbone_fpn"] = list(backbone_out["backbone_fpn"])
             backbone_out["backbone_fpn"][-1] = top + self.geometry_encoder(
                 geo.to(top.dtype), top.shape[-2:])
@@ -1663,7 +1843,8 @@ class SAMVTP(nn.Module):
         else:
             output_dict = self.output_dict
             if self.warp_memory and depth is not None and pose is not None:
-                output_dict = self._warped_output_dict(depth, pose, feat_sizes[-1])
+                output_dict = self._warped_output_dict(depth, pose, feat_sizes[-1],
+                                                       depth_valid=depth_valid)
             pix_feat = self.sam2_model.prepare_memory_conditioned_features(
                 frame_idx=self.frame_idx,
                 current_vision_feats=[vision_feats[-1]],

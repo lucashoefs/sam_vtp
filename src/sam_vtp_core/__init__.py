@@ -12,16 +12,22 @@ separately, since it needs OpenCV and is only used to build training data.
 
 from .architecture import (
     CameraIntrinsics,
+    Q_FLU_TO_NED_BODY,
+    Q_OPTICAL_TO_NED_BODY,
     SAMVTP,
     SAMVTPConfig,
     TARTANGROUND,
     geometry_channels,
+    pose_from_flu,
+    pose_from_optical,
+    quat_mul,
     warp_features,
 )
 from .factory import build_model, describe, load_checkpoint_state, read_checkpoint, resolve_path
 from .fullgraph import SAMVTPFullGraphReplayRunner
 from .inference import (
     compatible_input_hw,
+    depth_from_uint16_mm,
     infer_sequence,
     list_depths,
     list_images,
@@ -39,6 +45,12 @@ __all__ = [
     "TARTANGROUND",
     "geometry_channels",
     "warp_features",
+    "pose_from_optical",
+    "pose_from_flu",
+    "quat_mul",
+    "Q_OPTICAL_TO_NED_BODY",
+    "Q_FLU_TO_NED_BODY",
+    "depth_from_uint16_mm",
     "build_model",
     "describe",
     "read_checkpoint",
