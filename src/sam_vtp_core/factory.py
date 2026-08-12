@@ -59,6 +59,7 @@ def build_model(
     memory_write_every: int = 1,
     camera: Optional[CameraIntrinsics] = None,
     multimask: Optional[bool] = None,
+    components: Optional[Dict[str, bool]] = None,
     **config_overrides: Any,
 ) -> SAMVTP:
     """Build SAM-VTP and load `sam_vtp_checkpoint_path` into it.
@@ -77,6 +78,11 @@ def build_model(
         multimask: normally read from the checkpoint's training config. It is
             invisible in the weights, so a checkpoint without a config and
             without this flag falls back to False.
+        components: runtime switches, e.g. `{"memory": False}` for the
+            frame-wise ablation or `{"geometry": False}` for RGB-only. Keys are
+            `memory`, `warp`, `geometry`, `refine`. These select which of the
+            checkpoint's weights are USED; they cannot add a component the
+            checkpoint lacks. See `SAMVTP.set_components`.
         **config_overrides: forwarded to SAMVTPConfig. Overriding an
             architectural field here will make the checkpoint fail to load.
     """
@@ -92,18 +98,35 @@ def build_model(
     model.memory_write_every = max(1, int(memory_write_every))
     if camera is not None:
         model.camera = camera
+    if components:
+        model.set_components(**components)
     return model.to(device).eval()
 
 
 def describe(model: SAMVTP) -> str:
-    """One-line summary, for logs that need to record what actually ran."""
+    """One-line summary, for logs that need to record what actually ran.
+
+    Ends with an explicit ABLATED clause whenever a component is switched away
+    from how the weights were trained. Anything that logs this line can then
+    show, rather than assume, that a number came from the full model.
+    """
     n = sum(p.numel() for p in model.parameters())
+    active = model.active_components
     bits = [f"SAM-VTP {n / 1e6:.1f}M params",
-            f"memory {model.num_maskmem} frames",
-            f"warp {'on' if model.warp_memory else 'off'}",
-            f"geometry {'on' if model.use_geometry else 'off'}",
-            f"refine head {'on' if model.refine_head is not None else 'off'}",
+            f"memory {'on, ' + str(model.num_maskmem) + ' frames' if active['memory'] else 'OFF (frame-wise)'}",
+            f"warp {'on' if active['warp'] else 'off'}",
+            f"geometry {'on' if active['geometry'] else 'off'}",
+            f"refine head {'on' if active['refine'] else 'off'}",
             f"multimask {'on' if model.multimask_output else 'off'}"]
     if model.memory_write_every > 1:
         bits.append(f"memory write every {model.memory_write_every}")
-    return ", ".join(bits)
+    line = ", ".join(bits)
+
+    deviations = model.component_deviations
+    if deviations:
+        trained = model.trained_components
+        detail = ", ".join(
+            f"{k} {'on' if v else 'off'} (trained {'on' if trained[k] else 'off'})"
+            for k, v in sorted(deviations.items()))
+        line += f"  [ABLATED: {detail}]"
+    return line

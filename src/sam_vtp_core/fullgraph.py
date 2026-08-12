@@ -75,6 +75,15 @@ class SAMVTPFullGraphReplayRunner:
         if self.enabled and self._cadence_conflict:
             self.enabled = False
 
+        # With memory switched off there is no recurrent state to tensorise: the
+        # bank never fills, so capture could never trigger and every frame would
+        # quietly fall through to eager. Say so instead of reporting "capture
+        # pending" forever. The frame-wise path is cheap anyway -- it skips
+        # memory attention and the memory encoder entirely.
+        self._framewise = not bool(getattr(model, "use_memory", True))
+        if self.enabled and self._framewise:
+            self.enabled = False
+
         self.capture_warmup = max(0, int(capture_warmup))
 
         # The object-pointer temporal encoding is normalised by
@@ -88,6 +97,9 @@ class SAMVTPFullGraphReplayRunner:
             int(min_history_frames) if min_history_frames is not None else default_min_history)
 
         self._captured = False
+        # Component configuration the graph was captured under; compared on every
+        # replay so a later switch change cannot go unnoticed.
+        self._captured_component_epoch = -1
         self._capture_failed = False
         self._capture_error = ""
         self._graph = None
@@ -107,6 +119,8 @@ class SAMVTPFullGraphReplayRunner:
             if self._cadence_conflict:
                 return (f"CUDA Graph disabled (memory_write_every="
                         f"{self.model.memory_write_every} needs eager control flow)")
+            if self._framewise:
+                return "CUDA Graph disabled (memory switched off: no recurrent state to capture)"
             return "CUDA Graph disabled"
         if self._capture_failed:
             return f"CUDA Graph fell back to eager (capture failed: {self._capture_error})"
@@ -370,6 +384,7 @@ class SAMVTPFullGraphReplayRunner:
         s.non_cond_pose.copy_(snap[3])
         s.step_idx.copy_(snap[4])
         self._captured = True
+        self._captured_component_epoch = self.model.component_epoch
 
     def _copy_inputs(self, frame, depth, pose, depth_valid) -> None:
         self._static_input.copy_(frame)
@@ -393,6 +408,18 @@ class SAMVTPFullGraphReplayRunner:
         eager = lambda: self.model.forward_frame(  # noqa: E731
             frame, is_init_frame=is_init_frame, update_memory=update_memory,
             depth=depth, pose=pose, depth_valid=depth_valid)
+
+        # A captured graph has warp/geometry/refine/memory baked into its control
+        # flow, so a switch flipped afterwards would be ignored and the graph
+        # would keep replaying the configuration it was captured with -- silently
+        # reporting ablation numbers that are really the full model's, or the
+        # reverse. Refuse instead.
+        if self._captured and self.model.component_epoch != self._captured_component_epoch:
+            raise RuntimeError(
+                "component switches changed after the CUDA graph was captured; the "
+                "graph still holds the old configuration. Call set_components() "
+                "before the first frame, or build a new runner for the new "
+                "configuration.")
 
         if (not self.enabled) or self._capture_failed:
             return eager()

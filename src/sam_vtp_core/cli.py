@@ -39,6 +39,19 @@ def parse_args() -> argparse.Namespace:
                    help="write memory every k-th frame; raises the bank's time span on fast cameras")
     p.add_argument("--amp", choices=["fp16", "fp32"], default="fp16")
 
+    # Component switches. These select which of the checkpoint's weights are
+    # used; they cannot add a component it was not trained with. Any deviation
+    # from the as-trained configuration is printed by describe() below, so an
+    # ablation run is never mistaken for a full-model run in a log.
+    p.add_argument("--no-memory", dest="memory", action="store_false", default=None,
+                   help="frame-wise: predict each frame independently, no temporal memory")
+    p.add_argument("--no-warp", dest="warp", action="store_false", default=None,
+                   help="read memory without ego-motion alignment")
+    p.add_argument("--no-geometry", dest="geometry", action="store_false", default=None,
+                   help="RGB-only: drop the depth-derived feature (still needs depth if warping)")
+    p.add_argument("--no-refine", dest="refine", action="store_false", default=None,
+                   help="skip the residual refinement head")
+
     p.add_argument("--use-fullgraph", dest="use_fullgraph", action="store_true", default=None,
                    help="CUDA graph replay of the full forward pass; default on when CUDA is available")
     p.add_argument("--no-fullgraph", dest="use_fullgraph", action="store_false")
@@ -56,10 +69,14 @@ def main() -> int:
         raise RuntimeError("CUDA requested but not available")
     device = torch.device(args.device)
 
+    switches = {k: getattr(args, k) for k in ("memory", "warp", "geometry", "refine")
+                if getattr(args, k) is not None}
+
     model = build_model(
         args.checkpoint, device=device,
         normalization_mode=args.normalization,
         memory_write_every=int(args.memory_write_every),
+        components=switches or None,
     )
     print(describe(model))
 

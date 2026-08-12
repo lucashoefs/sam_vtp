@@ -41,8 +41,9 @@ from __future__ import annotations
 import copy
 import math
 from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -1619,6 +1620,24 @@ class SAMVTP(nn.Module):
         self.memory_write_every = 1
         self._frames_seen = 0
 
+        # Runtime component switches, as distinct from `cfg`. The config says
+        # which weights EXIST; these say which of them are used on this run. A
+        # switch can only ever turn a component off or back on -- it cannot
+        # conjure weights the checkpoint does not carry, and set_components()
+        # refuses rather than running a randomly-initialised module.
+        self.use_memory = True
+        self.use_refine_head = cfg.use_refine_head
+        self._trained_components: Dict[str, bool] = {
+            "memory": True,                    # any SAM-VTP checkpoint has memory
+            "warp": bool(cfg.warp_memory),
+            "geometry": bool(cfg.use_geometry),
+            "refine": bool(cfg.use_refine_head),
+        }
+        # Bumped on every switch change so a captured CUDA graph -- which bakes
+        # the configuration into its control flow -- can detect that it is stale
+        # instead of silently replaying the old one.
+        self._component_epoch = 0
+
         self.register_buffer("pixel_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer("pixel_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
@@ -1650,8 +1669,136 @@ class SAMVTP(nn.Module):
 
     @property
     def needs_geometry(self) -> bool:
-        """True when depth and pose are required for the model to behave as trained."""
-        return bool(self.warp_memory or self.use_geometry)
+        """True when depth and pose are required for the model to behave as trained.
+
+        The warp only acts when memory is read, so with memory switched off it
+        stops being a reason to demand depth and pose.
+        """
+        return bool(self.use_geometry or (self.warp_memory and self.use_memory))
+
+    # -- component switches --------------------------------------------------
+    #
+    # Four independent parts can be turned off at runtime:
+    #
+    #   memory    temporal memory bank. Off = frame-wise: every frame is
+    #             predicted from scratch, nothing is written or read.
+    #   warp      ego-motion alignment of stored memory before it is read.
+    #             Requires memory; a no-op without it.
+    #   geometry  the depth-derived feature added to the coarsest backbone level.
+    #   refine    the residual refinement head on the upsampled logits.
+    #
+    # Switching a component OFF on a checkpoint trained with it is a deliberate
+    # ablation, not a neutral configuration change: the remaining weights were
+    # fitted alongside it and are now running outside their training
+    # distribution. That is a legitimate measurement -- it is how the RGB-only
+    # and frame-wise rows of the paper's ablation are produced -- but it is not
+    # the same model as one TRAINED without the component, and the two should
+    # never be reported as if they were. `component_deviations` exists so a log
+    # line can tell them apart, and `describe()` prints it.
+    COMPONENTS: Tuple[str, ...] = ("memory", "warp", "geometry", "refine")
+
+    @property
+    def component_epoch(self) -> int:
+        """Increments on every switch change. Used to invalidate captured graphs."""
+        return self._component_epoch
+
+    @property
+    def active_components(self) -> Dict[str, bool]:
+        """Which components are in use right now."""
+        return {
+            "memory": bool(self.use_memory),
+            "warp": bool(self.warp_memory),
+            "geometry": bool(self.use_geometry),
+            "refine": bool(self.use_refine_head and self.refine_head is not None),
+        }
+
+    @property
+    def trained_components(self) -> Dict[str, bool]:
+        """Which components the loaded weights were trained with."""
+        return dict(self._trained_components)
+
+    @property
+    def component_deviations(self) -> Dict[str, bool]:
+        """Active components that differ from the as-trained configuration.
+
+        Empty when the model is running as trained. Non-empty means the numbers
+        this produces belong to an ablation, and saying so is the difference
+        between a result and a mistake.
+        """
+        active, trained = self.active_components, self._trained_components
+        return {k: v for k, v in active.items() if trained.get(k) != v}
+
+    def set_components(
+        self,
+        *,
+        memory: Optional[bool] = None,
+        warp: Optional[bool] = None,
+        geometry: Optional[bool] = None,
+        refine: Optional[bool] = None,
+    ) -> "SAMVTP":
+        """Turn components on or off. `None` leaves a component unchanged.
+
+        Turning one ON is only possible when the checkpoint actually carries its
+        weights; otherwise this raises rather than running a module at random
+        initialisation, which would look like a working model producing quietly
+        meaningless output.
+
+        Call before the first frame. Changing switches mid-sequence leaves a
+        memory bank written under the old configuration, so this resets memory
+        whenever `memory` or `warp` changes.
+
+        Returns self, so it chains: `build_model(...).set_components(memory=False)`.
+        """
+        requested = {"memory": memory, "warp": warp, "geometry": geometry, "refine": refine}
+        requested = {k: v for k, v in requested.items() if v is not None}
+        if not requested:
+            return self
+
+        missing = {
+            "warp": self.no_corr_embed is None,
+            "geometry": self.geometry_encoder is None,
+            "refine": self.refine_head is None,
+        }
+        for name, want in requested.items():
+            if want and missing.get(name, False):
+                raise ValueError(
+                    f"cannot enable '{name}': this checkpoint carries no weights for it "
+                    f"(trained with {self._trained_components}). Load a checkpoint that "
+                    "was trained with it instead -- enabling it here would run a "
+                    "randomly-initialised module.")
+
+        before = self.active_components
+        if "memory" in requested:
+            self.use_memory = bool(requested["memory"])
+        if "warp" in requested:
+            self.warp_memory = bool(requested["warp"])
+        if "geometry" in requested:
+            self.use_geometry = bool(requested["geometry"])
+        if "refine" in requested:
+            self.use_refine_head = bool(requested["refine"])
+
+        if self.active_components != before:
+            self._component_epoch += 1
+        if before["memory"] != self.use_memory or before["warp"] != self.warp_memory:
+            self.reset_memory()
+        return self
+
+    @contextmanager
+    def components(self, **switches: Optional[bool]) -> Iterator["SAMVTP"]:
+        """Apply switches for a block, then restore them.
+
+            with model.components(geometry=False):
+                rgb_only = model.forward_frame(rgb, is_init_frame=True)
+
+        Memory is reset on entry and on exit whenever the temporal path changes,
+        so the block cannot inherit or leak a bank written under the other
+        configuration.
+        """
+        previous = self.active_components
+        try:
+            yield self.set_components(**switches)
+        finally:
+            self.set_components(**previous)
 
     @property
     def memory_fill_level(self) -> float:
@@ -1807,8 +1954,8 @@ class SAMVTP(nn.Module):
         if self.needs_geometry and (depth is None or pose is None):
             raise ValueError(
                 "this checkpoint was trained with warp_memory/use_geometry, so it "
-                "needs depth (metres) and pose per frame. Pass them, or set "
-                "model.warp_memory = model.use_geometry = False to run the "
+                "needs depth (metres) and pose per frame. Pass them, or call "
+                "model.set_components(warp=False, geometry=False) to run the "
                 "RGB-only ablation deliberately.")
 
         B, _, H, W = image.shape
@@ -1832,7 +1979,9 @@ class SAMVTP(nn.Module):
 
         has_memory = bool(self.output_dict["cond_frame_outputs"]
                           or self.output_dict["non_cond_frame_outputs"])
-        if (not has_memory) or is_init_frame or self.frame_idx == 0:
+        # `use_memory=False` takes the same path as a first frame, every frame:
+        # the bank is neither read nor written, which is the frame-wise ablation.
+        if (not self.use_memory) or (not has_memory) or is_init_frame or self.frame_idx == 0:
             # The "no memory yet" token goes back into vision_feats, not just
             # into pix_feat, so it also reaches the memory encoder below. Upstream
             # SAM 2 keeps the two separate; the conditioning frame's stored memory
@@ -1894,9 +2043,11 @@ class SAMVTP(nn.Module):
             mask_logits, size=(H, W),
             mode="bicubic" if scale >= 3 else "bilinear", align_corners=False)
 
-        if self.refine_head is not None:
+        if self.refine_head is not None and self.use_refine_head:
             mask_logits = self.refine_head(mask_logits, image_norm)
 
+        if not self.use_memory:
+            update_memory = False
         if update_memory and self.memory_write_every > 1:
             if (self._frames_seen % self.memory_write_every) != 0:
                 update_memory = False
