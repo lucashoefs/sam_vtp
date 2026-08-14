@@ -303,6 +303,66 @@ def stage_breakdown(model: SAMVTP, img, dep, pose, dev, n: int) -> None:
     print(f"  {'(serialised sum)':22s} {total:7.2f} ms")
 
 
+def replay_cost_by_component(model, dev, mk, frames: int) -> None:
+    """What each optional stage costs in the regime the robot actually runs in.
+
+    The hook breakdown below can only run eagerly -- hooks do not fire inside a
+    captured graph -- so it measures a regime the deployment is not in, and
+    over-attributes to whatever launches the most kernels. Switching a component
+    off, re-capturing, and taking the difference measures the thing that matters,
+    and it uses the same switches the ablation study does, so a stage that looks
+    expensive here is a stage worth optimising rather than an artefact of how the
+    measurement was taken.
+
+    The differences do not have to sum to the total: turning one stage off can
+    let the rest overlap differently.
+    """
+    print("\n--- cost under graph replay, by switching stages off " + "-" * 19)
+    have = {"refine": model.refine_head is not None and model.use_refine_head,
+            "geometry": model.geometry_encoder is not None and model.use_geometry,
+            "warp": model.no_corr_embed is not None and model.warp_memory}
+
+    def measure(label: str, **switches) -> Optional[float]:
+        previous = {k: getattr(model, {"refine": "use_refine_head",
+                                       "geometry": "use_geometry",
+                                       "warp": "warp_memory"}[k])
+                    for k in switches}
+        try:
+            model.set_components(**switches)
+            model.reset_memory()
+            runner = SAMVTPFullGraphReplayRunner(model, dev, enabled=True,
+                                                 capture_warmup=2)
+            for t in range(max(20, runner.min_history_frames + 3)):
+                img, dep, pose = mk(t)
+                runner.run(img, is_init_frame=(t == 0), depth=dep, pose=pose)
+            if not runner._captured:
+                print(f"  {label:24s} capture did not engage; skipped")
+                return None
+            img, dep, pose = mk(99)
+            ms = statistics.median(timed(
+                lambda: runner.run(img, is_init_frame=False, depth=dep, pose=pose),
+                frames, dev))
+            return ms
+        finally:
+            model.set_components(**previous)
+
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
+        base = measure("baseline", **{})
+        if base is None:
+            return
+        print(f"  {'all stages on':24s} {base:7.2f} ms")
+        for name, on in have.items():
+            if not on:
+                continue
+            key = {"refine": "refine", "geometry": "geometry", "warp": "warp"}[name]
+            off = measure(f"{name} off", **{key: False})
+            if off is None:
+                continue
+            print(f"  {'without ' + name:24s} {off:7.2f} ms   "
+                  f"{name} costs {base - off:6.2f} ms "
+                  f"({100 * (base - off) / base:4.1f}% of the frame)")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -314,6 +374,9 @@ def main() -> int:
     ap.add_argument("--amp", choices=["fp16", "bf16", "fp32"], default="fp16")
     ap.add_argument("--no-graph", action="store_true", help="skip the graph-replay pass")
     ap.add_argument("--skip-stages", action="store_true")
+    ap.add_argument("--skip-ablate", action="store_true",
+                    help="skip the switch-a-stage-off pass (it re-captures the "
+                         "graph once per stage, so it is the slow part)")
     ap.add_argument("--allow-busy-gpu", action="store_true",
                     help="time anyway with another process on the GPU (numbers will be junk)")
     args = ap.parse_args()
@@ -389,6 +452,9 @@ def main() -> int:
             gmed = statistics.median(g)
             print(f"  graph replay    {gmed:7.2f} ms  {1000 / gmed:6.2f} FPS  "
                   f"{gf / gmed:6.2f} TFLOP/s effective   ({med / gmed:.2f}x over eager)")
+
+    if not args.no_graph and dev.type == "cuda" and not args.skip_ablate:
+        replay_cost_by_component(model, dev, mk, max(20, args.frames // 2))
 
     if not args.skip_stages:
         model.reset_memory()

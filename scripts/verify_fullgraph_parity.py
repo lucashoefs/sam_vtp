@@ -117,7 +117,8 @@ def main() -> int:
         if d > worst:
             worst, worst_t = d, t
     print(f"frames compared  : {n} ({first_replay} eager warmup, rest replayed)")
-    print(f"max |dlogit|     : {worst:.3e} (frame {worst_t})")
+    where = "no frame disagreed" if worst_t < 0 else f"frame {worst_t}"
+    print(f"max |dlogit|     : {worst:.3e} ({where})")
     if not runner._captured:
         print("NOTE: capture never happened, so this compared eager against eager.")
         return 1

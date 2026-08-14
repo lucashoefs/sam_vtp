@@ -1416,10 +1416,31 @@ def _odd(n: float, lo: int = 3) -> int:
     return k if k % 2 == 1 else k + 1
 
 
+# Median-of-9 as a selection network: 19 compare-exchanges, each a pair of
+# elementwise min/max. Sorting nine values to take the fifth is the obvious way
+# to write it, but `unfold(2,3,1).unfold(3,3,1).reshape(...)` cannot be a view,
+# so it gathers nine copies of the frame into one tensor before the sort kernel
+# even starts. This version reads nine shifted views and never materialises them.
+#
+# Bit-exact against the sort for finite input, ties included -- a correct
+# selection network returns the same element, not merely an equal one. NaN is
+# the exception (min/max propagate it differently than sort does), and the one
+# caller passes `z_raw`, which `torch.where(valid, ...)` has already made finite.
+_MEDIAN9_NETWORK = (
+    (1, 2), (4, 5), (7, 8), (0, 1), (3, 4), (6, 7), (1, 2), (4, 5), (7, 8),
+    (0, 3), (5, 8), (4, 7), (3, 6), (1, 4), (2, 5), (4, 7), (4, 2), (6, 4),
+    (4, 2),
+)
+
+
 def _median3(x: torch.Tensor) -> torch.Tensor:
     p = F.pad(x, (1, 1, 1, 1), mode="replicate")
-    patches = p.unfold(2, 3, 1).unfold(3, 3, 1).reshape(*x.shape, 9)
-    return patches.median(dim=-1).values
+    h, w = x.shape[-2:]
+    v = [p[..., i:i + h, j:j + w] for i in range(3) for j in range(3)]
+    for a, b in _MEDIAN9_NETWORK:
+        lo, hi = torch.minimum(v[a], v[b]), torch.maximum(v[a], v[b])
+        v[a], v[b] = lo, hi
+    return v[4]
 
 
 def geometry_channels(depth: torch.Tensor, out_hw: Tuple[int, int] = (256, 256),
