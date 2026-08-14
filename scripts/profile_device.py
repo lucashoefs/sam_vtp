@@ -19,7 +19,10 @@ Three questions it answers, in order of how much they tend to matter:
 
 Timing needs the GPU to itself. A concurrent training job makes every number
 here meaningless, so this refuses to run when the GPU is already busy unless
---allow-busy-gpu says otherwise.
+--allow-busy-gpu says otherwise. Where the driver cannot enumerate compute
+processes at all -- which is the normal case on Tegra, where nvidia-smi answers
+"[N/A]" rather than "none" -- it falls back to timing a fixed kernel and looking
+at the spread, since a contended GPU is an uneven one.
 
     python scripts/profile_device.py --height 512 --width 512
     python scripts/profile_device.py --checkpoint sam_vtp.pt --frames 200
@@ -56,6 +59,55 @@ def _sh(cmd: str) -> str:
         return ""
 
 
+def gpu_compute_processes():
+    """(processes, note). `note` is set when we cannot actually tell.
+
+    On Tegra the GPU is integrated and nvidia-smi does not track compute apps:
+    the query returns a row of literal "[N/A]" fields rather than no rows at
+    all. Reading that as two live processes is what made this refuse to run on
+    the very target it was written for, so a row only counts when its pid field
+    is a number.
+    """
+    raw = _sh("nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader")
+    procs = [ln.strip() for ln in raw.splitlines()
+             if ln.split(",")[0].strip().isdigit()]
+    if procs:
+        return procs, ""
+    if raw.strip():
+        return [], ("nvidia-smi cannot enumerate compute processes on this GPU "
+                    "(usual on Tegra)")
+    return [], ""
+
+
+def contention_probe(dev: torch.device, note: str) -> None:
+    """Ask the GPU itself whether it is busy, when the driver will not say.
+
+    A contended GPU does not just run slower, it runs *unevenly*: the same
+    kernel lands between other people's work and the spread blows up. Timing
+    one fixed matmul repeatedly and looking at p90/median detects that without
+    needing to know who else is running.
+    """
+    print(f"\n--- contention probe " + "-" * 51)
+    print(f"  {note}, so measuring the spread of a fixed kernel instead.")
+    a = torch.randn(1024, 1024, device=dev, dtype=torch.float16)
+    b = torch.randn(1024, 1024, device=dev, dtype=torch.float16)
+    for _ in range(10):
+        a @ b
+    samples = sorted(timed(lambda: a @ b, 60, dev))
+    med = statistics.median(samples)
+    p90 = samples[int(0.90 * (len(samples) - 1))]
+    ratio = p90 / med if med > 0 else 1.0
+    print(f"  median {med * 1e3:7.1f} us   p90 {p90 * 1e3:7.1f} us   "
+          f"p90/median {ratio:.2f}")
+    if ratio > 1.5:
+        print("  ^ SPREAD IS HIGH: something else is very likely using the GPU."
+              "\n    Treat every timing below as contended.")
+    else:
+        print("  spread is tight; the GPU looks idle apart from this process.")
+    del a, b
+    torch.cuda.empty_cache()
+
+
 def report_device(dev: torch.device) -> None:
     print("=" * 72)
     if dev.type == "cuda":
@@ -75,9 +127,17 @@ def report_device(dev: torch.device) -> None:
         nvp = _sh("nvpmodel -q 2>/dev/null | head -4")
         if nvp:
             print("nvpmodel    : " + nvp.replace("\n", " | "))
-        print("            (jetson_clocks pins clocks to the cap for the active mode;"
-              "\n             JetPack 6.2 'Super' modes raise both clock and memory"
-              "\n             bandwidth substantially over the launch defaults)")
+        # jetson_clocks only pins to the ceiling of the *active* mode, so a
+        # stack that pins clocks but never sets the mode silently runs at the
+        # boot default. Say which of the two situations this is.
+        if "SUPER" in nvp.upper() or "MAXN" in nvp.upper():
+            print("            ^ top power mode: GPU clock and memory bandwidth are"
+                  "\n              uncapped. Nothing to gain here.")
+        elif nvp:
+            print("            ^ NOT the top power mode. On JetPack 6.2+ the 'Super'"
+                  "\n              modes raise GPU clock and memory bandwidth well above"
+                  "\n              the launch defaults; jetson_clocks cannot exceed the"
+                  "\n              active mode's cap. `sudo nvpmodel -m <id>` first.")
     print("=" * 72)
 
 
@@ -261,12 +321,12 @@ def main() -> int:
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     report_device(dev)
 
+    probe_note = ""
     if dev.type == "cuda" and not args.allow_busy_gpu:
-        busy = _sh("nvidia-smi --query-compute-apps=pid,used_memory "
-                   "--format=csv,noheader")
+        busy, probe_note = gpu_compute_processes()
         if busy:
-            print(f"\nREFUSING TO TIME: the GPU already has compute processes on it:\n  "
-                  + busy.replace("\n", "\n  ")
+            print("\nREFUSING TO TIME: the GPU already has compute processes on it:\n  "
+                  + "\n  ".join(busy)
                   + "\nContention makes every number below meaningless. Wait for it to"
                     "\nfinish, or pass --allow-busy-gpu if you only want the SDPA check.")
             return 1
@@ -283,10 +343,10 @@ def main() -> int:
     mem_tokens = feat_tokens * model.num_maskmem + 4 * model.num_maskmem
     check_sdpa(dev, feat_tokens, mem_tokens)
 
-    if dev.type == "cuda" and not args.allow_busy_gpu:
-        pass
-    elif args.allow_busy_gpu:
-        print("\n--allow-busy-gpu: timings below are contended and not comparable.")
+    if args.allow_busy_gpu:
+        print("\n--allow-busy-gpu: timings below may be contended and not comparable.")
+    elif probe_note and dev.type == "cuda":
+        contention_probe(dev, probe_note)
 
     amp = torch.float16 if args.amp == "fp16" else (
         torch.bfloat16 if args.amp == "bf16" else torch.float32)

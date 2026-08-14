@@ -23,7 +23,14 @@ from .architecture import (
     quat_mul,
     warp_features,
 )
-from .factory import build_model, describe, load_checkpoint_state, read_checkpoint, resolve_path
+from .factory import (
+    build_model,
+    describe,
+    load_checkpoint_state,
+    read_checkpoint,
+    resolve_path,
+    tune_for_inference,
+)
 from .fullgraph import SAMVTPFullGraphReplayRunner
 from .inference import (
     compatible_input_hw,
@@ -56,6 +63,7 @@ __all__ = [
     "read_checkpoint",
     "load_checkpoint_state",
     "resolve_path",
+    "tune_for_inference",
     "infer_sequence",
     "list_images",
     "list_depths",

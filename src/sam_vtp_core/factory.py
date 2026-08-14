@@ -21,6 +21,25 @@ def resolve_path(path_like: str) -> Path:
     return Path(path_like).expanduser().resolve()
 
 
+def tune_for_inference() -> str:
+    """Set the process-wide backend flags a fixed-shape deployment wants.
+
+    Kept as an explicit call rather than an import side effect: these are global
+    and they change results. `cudnn.benchmark` times the available convolution
+    algorithms on first use and keeps the fastest, so it needs the shapes to be
+    stable -- true here, and `SAMVTP.warmup` pays the search off the clock -- but
+    a different algorithm rounds differently, so output moves within floating
+    point tolerance rather than staying bit-identical. Do not turn it on for a
+    run whose numbers have to reproduce an earlier one exactly.
+
+    Returns a one-line description, worth logging next to the model banner.
+    """
+    if not torch.cuda.is_available():
+        return "tune_for_inference: no CUDA, nothing to set"
+    torch.backends.cudnn.benchmark = True
+    return "tune_for_inference: cudnn.benchmark=True (fixed shapes; not bit-exact)"
+
+
 def load_checkpoint_state(path: str, map_location: str = "cpu") -> Dict[str, Any]:
     """Just the weights, for callers that do not care about training metadata."""
     return read_checkpoint(path, map_location=map_location)[0]

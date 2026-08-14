@@ -20,11 +20,26 @@ convolutions, and the warp is a single `grid_sample` over a constant 7-fold
 batch. The current frame's depth and pose are static input buffers, exactly like
 the image.
 
+Write cadence
+-------------
+A frame that does not write to the bank differs from one that does only in the
+tail of the pass: no memory encode, no shift, no step advance. That is a branch,
+and a graph cannot take a branch -- but it can be two graphs, with the branch in
+Python outside both. `capture_nowrite=True` captures the second one, which is
+what lets a write cadence coexist with replay instead of turning it off.
+
+The two graphs deliberately do NOT share a memory pool. Sharing one is the
+documented way to save memory across captures, but it also lets a replay of one
+graph land on the other's buffers; here the second pass costs a few hundred MB
+once, which is the cheaper side of that trade on a device with memory to spare.
+
 Limitations
 -----------
-  * `memory_write_every > 1` disables it: the capture bakes in the write.
   * The bank must be full before capture, which `min_history_frames` enforces.
     Warmup frames run eagerly.
+  * Once capture has happened there is no going back to eager: the dict-based
+    memory in `architecture.py` stops being updated, so an eager frame after a
+    replayed one would read stale state. Mismatches raise instead.
   * This is a second implementation of the forward pass. Run
     `scripts/verify_fullgraph_parity.py` after changing `architecture.py`.
 """
@@ -65,15 +80,18 @@ class SAMVTPFullGraphReplayRunner:
     """Full-forward CUDA graph replay with tensorised recurrent state."""
 
     def __init__(self, model: SAMVTP, device: torch.device, enabled: bool,
-                 capture_warmup: int = 0, min_history_frames: Optional[int] = None):
+                 capture_warmup: int = 0, min_history_frames: Optional[int] = None,
+                 capture_nowrite: Optional[bool] = None):
         self.model = model
         self.device = device
         self.enabled = (bool(enabled) and device.type == "cuda"
                         and hasattr(torch.cuda, "CUDAGraph"))
 
-        self._cadence_conflict = int(getattr(model, "memory_write_every", 1)) > 1
-        if self.enabled and self._cadence_conflict:
-            self.enabled = False
+        # A second graph for frames that skip the memory write. Requested
+        # explicitly by a caller that gates on wall-clock time; inferred from the
+        # model when the cadence is a fixed frame count.
+        self._capture_nowrite = (int(getattr(model, "memory_write_every", 1)) > 1
+                                 if capture_nowrite is None else bool(capture_nowrite))
 
         # With memory switched off there is no recurrent state to tensorise: the
         # bank never fills, so capture could never trigger and every frame would
@@ -103,12 +121,14 @@ class SAMVTPFullGraphReplayRunner:
         self._capture_failed = False
         self._capture_error = ""
         self._graph = None
+        self._graph_nowrite = None
         self._state: Optional[_TensorState] = None
         self._static_input: Optional[torch.Tensor] = None
         self._static_depth: Optional[torch.Tensor] = None
         self._static_pose: Optional[torch.Tensor] = None
         self._static_valid: Optional[torch.Tensor] = None
         self._static_output: Optional[Dict[str, torch.Tensor]] = None
+        self._static_output_nowrite: Optional[Dict[str, torch.Tensor]] = None
 
         self._k = max(0, int(model.num_maskmem) - 1)
         self._obj_ptr_tdiff_max = max(1.0, float(model.sam2_model.max_obj_ptrs_in_encoder - 1))
@@ -116,9 +136,6 @@ class SAMVTPFullGraphReplayRunner:
 
     def status_note(self) -> str:
         if not self.enabled:
-            if self._cadence_conflict:
-                return (f"CUDA Graph disabled (memory_write_every="
-                        f"{self.model.memory_write_every} needs eager control flow)")
             if self._framewise:
                 return "CUDA Graph disabled (memory switched off: no recurrent state to capture)"
             return "CUDA Graph disabled"
@@ -131,7 +148,12 @@ class SAMVTPFullGraphReplayRunner:
             if self.model.use_geometry:
                 extra.append("geometry")
             suffix = f", {' + '.join(extra)} in graph" if extra else ""
-            return f"CUDA Graph replay active (full forward{suffix})"
+            cadence = ""
+            if self._graph_nowrite is not None:
+                every = int(getattr(self.model, "memory_write_every", 1))
+                cadence = (f", 2 graphs (write every {every})" if every > 1
+                           else ", 2 graphs (gated writes)")
+            return f"CUDA Graph replay active (full forward{suffix}{cadence})"
         return "CUDA Graph enabled (history warmup / capture pending)"
 
     @staticmethod
@@ -269,7 +291,8 @@ class SAMVTPFullGraphReplayRunner:
             num_obj_ptr_tokens=obj_ptrs.shape[0])
         return out.permute(1, 2, 0).view(B, C, H, W)
 
-    def _forward_tensorized_state(self, frame: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def _forward_tensorized_state(self, frame: torch.Tensor,
+                                  update_memory: bool = True) -> Dict[str, torch.Tensor]:
         assert self._state is not None
         model, core = self.model, self.model.sam2_model
         B, _, H, W = frame.shape
@@ -320,6 +343,13 @@ class SAMVTPFullGraphReplayRunner:
             # omitting it made `--no-refine` a no-op under graph replay.
             mask_logits = model.refine_head(mask_logits, image_norm)
 
+        if not update_memory:
+            # Stop exactly where the eager path stops for a non-write frame
+            # (architecture.forward_frame, `if not update_memory: return`):
+            # no memory encode, no bank shift, and no step_idx advance, since
+            # eager also returns before incrementing frame_idx.
+            return {"logits": mask_logits}
+
         object_score_logits = torch.any(mask_logits.flatten(1) > 0.0, dim=1, keepdim=True).float()
         maskmem_features, maskmem_pos_enc = core.encode_new_memory(
             current_vision_feats=vision_feats, feat_sizes=feat_sizes,
@@ -368,6 +398,17 @@ class SAMVTPFullGraphReplayRunner:
             self._graph = torch.cuda.CUDAGraph()
             with self._graph_context(self._graph):
                 self._static_output = self._forward_tensorized_state(self._static_input)
+
+            if self._capture_nowrite:
+                # Capturing this one *after* the write graph is deliberate: the
+                # write graph's capture leaves the bank shifted, and this pass
+                # only reads it, so whatever it sees is representative of a
+                # steady-state frame. Own pool, so replaying one graph can never
+                # scribble on the other's buffers.
+                self._graph_nowrite = torch.cuda.CUDAGraph()
+                with self._graph_context(self._graph_nowrite):
+                    self._static_output_nowrite = self._forward_tensorized_state(
+                        self._static_input, update_memory=False)
         torch.cuda.current_stream(self.device).wait_stream(capture_stream)
 
         s.non_cond_maskmem_features.copy_(snap[0])
@@ -387,15 +428,35 @@ class SAMVTPFullGraphReplayRunner:
         if self._static_valid is not None and depth_valid is not None:
             self._static_valid.copy_(depth_valid.float())
 
+    def _writes_this_frame(self, update_memory: bool) -> bool:
+        """Mirror the eager cadence gate, and advance the counter it reads.
+
+        `architecture.forward_frame` decides on `_frames_seen % write_every` and
+        then increments `_frames_seen`. Doing the same here on the *same*
+        counter is what keeps the cadence in phase across the eager-to-replay
+        handover: the graph path picking up its own counter at zero would
+        restart the cadence and put the writes on different frames than the
+        warmup had them on.
+        """
+        model = self.model
+        if not model.use_memory:
+            update_memory = False
+        every = int(getattr(model, "memory_write_every", 1))
+        if update_memory and every > 1 and (model._frames_seen % every) != 0:
+            update_memory = False
+        model._frames_seen += 1
+        return update_memory
+
     def run(self, frame: torch.Tensor, is_init_frame: bool, update_memory: bool = True,
             depth: Optional[torch.Tensor] = None, pose: Optional[torch.Tensor] = None,
             depth_valid: Optional[torch.Tensor] = None):
         """Run one frame, replaying the captured graph when possible.
 
-        `update_memory=False` is honoured only on the eager path, since a
-        captured graph has the write baked into its control flow. The
-        constructor already disables graph mode when the model carries a write
-        cadence.
+        `update_memory=False` is honoured under replay too, via the second
+        captured graph. It needs `capture_nowrite=True` at construction; without
+        it there is no non-writing graph to replay and the call raises, because
+        silently writing anyway would corrupt the bank's temporal spacing and
+        silently falling back to eager would read stale dict state.
         """
         eager = lambda: self.model.forward_frame(  # noqa: E731
             frame, is_init_frame=is_init_frame, update_memory=update_memory,
@@ -434,6 +495,16 @@ class SAMVTPFullGraphReplayRunner:
                     pass
                 return eager()
 
+        writes = self._writes_this_frame(update_memory)
+        if not writes and self._graph_nowrite is None:
+            raise RuntimeError(
+                "update_memory=False under CUDA-graph replay, but no non-writing "
+                "graph was captured. Build the runner with capture_nowrite=True "
+                "(SAMVTPStreamProcessor does this when a write cadence is set).")
+
         self._copy_inputs(frame, depth, pose, depth_valid)
-        self._graph.replay()
-        return self._static_output
+        if writes:
+            self._graph.replay()
+            return self._static_output
+        self._graph_nowrite.replay()
+        return self._static_output_nowrite

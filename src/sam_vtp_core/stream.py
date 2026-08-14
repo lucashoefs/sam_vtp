@@ -27,6 +27,19 @@ StreamCallback = Callable[["StreamStepResult"], None]
 INPUT_FITS = ("stretch", "crop", "pad")
 
 
+def _upload(t: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Move to the device, then widen -- not the other way round.
+
+    `t.to(device, torch.float32)` on a uint8 frame casts on the CPU first and
+    then moves four bytes per pixel instead of one. Uploading narrow and casting
+    on the GPU is bit-identical and moves a quarter of the bytes, which is worth
+    having on a board where the CPU is weak and the "PCIe" bus is really the
+    same DRAM the GPU is reading from.
+    """
+    out = t.to(device, non_blocking=True)
+    return out if out.dtype == torch.float32 else out.float()
+
+
 @dataclass
 class StreamStepResult:
     frame_index: int
@@ -58,6 +71,7 @@ class SAMVTPStreamProcessor:
         return_numpy: bool = False,
         memory_write_every: Optional[int] = None,
         memory_write_interval_s: Optional[float] = None,
+        time_model_only: bool = True,
     ):
         """
         Args:
@@ -68,18 +82,31 @@ class SAMVTPStreamProcessor:
                 easy to get wrong by hand.
             return_numpy: return maps as numpy `(H, W)` arrays instead of torch
                 tensors, so a consumer needs no torch layout knowledge.
+            time_model_only: synchronise before reading the clock, so
+                `elapsed_ms` is the model and not the model plus whatever the
+                caller does next. That is what you want when benchmarking. In a
+                deployment it drains the device once for the measurement and
+                again on the first read of the result, so a consumer that only
+                wants the mask can set this False and let the postprocessing
+                pipeline behind the forward pass; `elapsed_ms` then reports
+                launch time rather than compute time.
             memory_write_every: write memory only every k-th frame.
             memory_write_interval_s: write memory at most this often in
-                wall-clock seconds. Takes precedence over `memory_write_every`
-                and is the better choice for a live camera, whose rate varies.
+                wall-clock seconds. Takes precedence over `memory_write_every`,
+                and suits a camera whose rate wanders; on a camera that holds
+                its rate, `memory_write_every` gets the same spacing
+                deterministically, which is easier to reason about.
 
         Why cadence matters: the bank holds a fixed number of *frames*, so the
         time it spans is set by the frame rate. Training used about 0.2 s
         between memory frames, giving the 7-slot bank roughly a 1.2 s window.
         Running at 35 FPS with a write per frame collapses that to about 0.2 s
         and the bank fills with near-duplicate views. Predictions are still
-        produced every frame; only the write is gated. Note that gating needs
-        per-frame control flow, so it turns off CUDA-graph replay.
+        produced every frame; only the write is gated.
+
+        Gating no longer costs graph replay. The decision is made here, in
+        Python, and each of the two outcomes has its own captured graph, so a
+        cadence and CUDA graphs coexist -- see `fullgraph.py`.
         """
         if input_fit not in INPUT_FITS:
             raise ValueError(f"input_fit must be one of {INPUT_FITS}, got {input_fit!r}")
@@ -98,6 +125,7 @@ class SAMVTPStreamProcessor:
         self.input_fit = input_fit
         self.reset_on_size_change = bool(reset_on_size_change)
         self.return_numpy = bool(return_numpy)
+        self.time_model_only = bool(time_model_only)
 
         # The camera the caller configured, at its native resolution. The fit
         # derives from this; the model's own `camera` is overwritten to match
@@ -114,17 +142,21 @@ class SAMVTPStreamProcessor:
         self._last_memory_write_t: Optional[float] = None
         if memory_write_every is not None:
             self.model.memory_write_every = max(1, int(memory_write_every))
-        if self.memory_write_interval_s is not None:
-            self.use_fullgraph = False
 
         self._build_runner()
         self.model.reset_memory()
 
     def _build_runner(self) -> None:
+        # Gated writes need a second captured graph for the frames that skip the
+        # write. Without one the runner would have to choose between writing
+        # anyway and falling back to eager, and both are wrong.
+        gated = (self.memory_write_interval_s is not None
+                 or int(getattr(self.model, "memory_write_every", 1)) > 1)
         self._runner = SAMVTPFullGraphReplayRunner(
             model=self.model, device=self.device, enabled=self.use_fullgraph,
             capture_warmup=self.capture_warmup,
-            min_history_frames=self.fullgraph_min_history)
+            min_history_frames=self.fullgraph_min_history,
+            capture_nowrite=gated)
 
     @property
     def graph_status(self) -> str:
@@ -223,13 +255,25 @@ class SAMVTPStreamProcessor:
 
     # -- input marshalling ---------------------------------------------------
     @staticmethod
-    def _to_bchw(frame: FrameInput, channels: int = 3) -> torch.Tensor:
+    def _to_bchw(frame: FrameInput, channels: int = 3,
+                 device: Optional[torch.device] = None) -> torch.Tensor:
+        """Normalise any accepted layout to [1, channels, H, W].
+
+        `device` moves the frame across *before* the layout work. A camera hands
+        over HWC, so reaching BCHW means a transpose; doing it on the CPU costs a
+        full copy of the frame in the node's own thread, and on the GPU it costs
+        almost nothing. The upload itself is unchanged either way -- same bytes,
+        same dtype, just reordered on the other side.
+        """
         if isinstance(frame, np.ndarray):
             tensor = torch.from_numpy(np.ascontiguousarray(frame))
         elif torch.is_tensor(frame):
             tensor = frame
         else:
             raise TypeError("frame must be a numpy.ndarray or torch.Tensor")
+
+        if device is not None:
+            tensor = tensor.to(device, non_blocking=True)
 
         if tensor.ndim == 2 and channels == 1:
             return tensor[None, None].contiguous()
@@ -272,7 +316,7 @@ class SAMVTPStreamProcessor:
                 shows up as smearing in the warped memory.
             depth_valid: optional mask; see `SAMVTP.forward_frame`.
         """
-        x = self._to_bchw(frame).to(self.device, torch.float32, non_blocking=True)
+        x = _upload(self._to_bchw(frame, device=self.device), self.device)
         in_h, in_w = int(x.shape[-2]), int(x.shape[-1])
 
         if self._stream_hw is None:
@@ -295,13 +339,12 @@ class SAMVTPStreamProcessor:
 
         d = dv = None
         if depth is not None:
-            d = self._to_bchw(depth, channels=1).to(self.device, torch.float32,
-                                                    non_blocking=True)
+            d = _upload(self._to_bchw(depth, channels=1, device=self.device), self.device)
             if d.shape[-2:] != (in_h, in_w):
                 d = F.interpolate(d, size=(in_h, in_w), mode="nearest-exact")
         if depth_valid is not None:
-            dv = self._to_bchw(depth_valid, channels=1).to(self.device, torch.float32,
-                                                           non_blocking=True)
+            dv = _upload(self._to_bchw(depth_valid, channels=1, device=self.device),
+                         self.device)
             if dv.shape[-2:] != (in_h, in_w):
                 dv = F.interpolate(dv, size=(in_h, in_w), mode="nearest-exact")
 
@@ -350,7 +393,7 @@ class SAMVTPStreamProcessor:
             out = self._runner.run(x, is_init_frame=is_init, update_memory=update_memory,
                                    depth=d, pose=p, depth_valid=dv)
 
-        if self.device.type == "cuda":
+        if self.device.type == "cuda" and self.time_model_only:
             torch.cuda.synchronize(self.device)
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
 

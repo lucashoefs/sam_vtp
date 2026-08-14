@@ -38,6 +38,10 @@ def main() -> int:
     ap.add_argument("--tolerance", type=float, default=1e-3)
     ap.add_argument("--rgb-only", action="store_true",
                     help="force warp_memory and use_geometry off")
+    ap.add_argument("--memory-write-every", type=int, default=1,
+                    help="write to the bank every k-th frame. >1 exercises the "
+                         "second captured graph, and checks that the cadence "
+                         "stays in phase across the eager-to-replay handover")
     ap.add_argument("--memory-fraction", type=float, default=0.0,
                     help="cap this process's GPU memory, to share a busy device")
     a = ap.parse_args()
@@ -59,10 +63,14 @@ def main() -> int:
             m = SAMVTP(SAMVTPConfig()).to(device).eval()
         if a.rgb_only:
             m.warp_memory = m.use_geometry = False
+        m.memory_write_every = max(1, int(a.memory_write_every))
         return m
 
     torch.manual_seed(0)
-    n = a.frames
+    every = max(1, int(a.memory_write_every))
+    # The bank fills `every` times slower, and capture waits for a full bank, so
+    # a run long enough at every=1 replays nothing at every=3.
+    n = a.frames if every == 1 else max(a.frames, 24 * every)
     frames = [torch.randint(0, 256, (1, 3, a.size, a.size), device=device).float()
               for _ in range(n)]
 
@@ -96,7 +104,9 @@ def main() -> int:
     eager = run(probe)
 
     graph_model = make()
-    runner = SAMVTPFullGraphReplayRunner(graph_model, device, enabled=True, capture_warmup=1)
+    runner = SAMVTPFullGraphReplayRunner(graph_model, device, enabled=True,
+                                         capture_warmup=1,
+                                         capture_nowrite=every > 1)
     graphed = run(graph_model, runner)
 
     print(runner.status_note())
@@ -111,6 +121,17 @@ def main() -> int:
     if not runner._captured:
         print("NOTE: capture never happened, so this compared eager against eager.")
         return 1
+    if every > 1:
+        # Divergent cadence is the failure this flag exists to catch, and it
+        # would otherwise look like a small numeric drift rather than the two
+        # models holding different memory.
+        print(f"write cadence    : every {every} frames; "
+              f"eager wrote {probe.frame_idx}, graph wrote {graph_model.frame_idx} "
+              f"(+{runner._state.step_idx.item() - graph_model.frame_idx:.0f} "
+              f"inside the graph)")
+        if runner._graph_nowrite is None:
+            print("NOTE: no non-writing graph was captured; the cadence was not tested.")
+            return 1
     ok = worst <= a.tolerance
     print("PARITY OK" if ok else f"PARITY FAILED (tolerance {a.tolerance:.1e})")
     return 0 if ok else 1

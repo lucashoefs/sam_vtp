@@ -92,8 +92,13 @@ SAMVTPStreamProcessor(model, memory_write_interval_s=0.2)  # wall-clock, best fo
 SAMVTPStreamProcessor(model, memory_write_every=3)         # every k-th frame, for fixed-rate sources
 ```
 
-Every frame still gets a prediction, only the write is gated. Cadence needs eager
-control flow, so it turns off CUDA-graph replay.
+Every frame still gets a prediction, only the write is gated.
+
+Cadence and CUDA-graph replay are compatible. The gate is decided in Python, and
+each of the two outcomes gets its own captured graph, so a gated frame replays
+the one that skips the memory encode and the bank shift. The cost is a second
+graph's worth of workspace, and a proportionally longer warmup: capture waits for
+a full bank, which at `memory_write_every=k` takes k times as many frames.
 
 ## Streaming
 
