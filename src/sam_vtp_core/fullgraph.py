@@ -288,17 +288,7 @@ class SAMVTPFullGraphReplayRunner:
         vision_feats, vision_pos_embeds, feat_sizes = core.prepare_backbone_features(backbone_out)
         pix_feat = self._memory_conditioned_pix_feat(vision_feats, vision_pos_embeds, feat_sizes)
 
-        sparse, dense = core.sam_prompt_encoder(points=None, boxes=None, masks=None)
-        sparse = sparse.expand(B, -1, -1)
-        dense = dense.expand(B, -1, -1, -1)
-        if dense.shape[-2:] != pix_feat.shape[-2:]:
-            dense = F.interpolate(dense, size=pix_feat.shape[-2:], mode="bilinear",
-                                  align_corners=False)
-        image_pe = core.sam_prompt_encoder.get_dense_pe()
-        if image_pe.shape[-2:] != pix_feat.shape[-2:]:
-            image_pe = F.interpolate(image_pe, size=pix_feat.shape[-2:], mode="bilinear",
-                                     align_corners=False)
-        image_pe = image_pe.to(device=pix_feat.device, dtype=pix_feat.dtype)
+        sparse, dense, image_pe = model._prompt_tensors(pix_feat, B)
 
         high_res_feats = [f.permute(1, 2, 0).view(B, -1, *sz)
                           for f, sz in zip(vision_feats[:-1], feat_sizes[:-1])]
@@ -322,10 +312,12 @@ class SAMVTPFullGraphReplayRunner:
         mask_logits = F.interpolate(mask_logits, size=(H, W),
                                     mode="bicubic" if scale >= 3 else "bilinear",
                                     align_corners=False)
-        if model.refine_head is not None:
+        if model.refine_head is not None and model.use_refine_head:
             # Must run here as well: without it, graph mode returns unrefined
             # logits and eager mode returns refined ones, so the same checkpoint
-            # gives two different answers depending on a speed flag.
+            # gives two different answers depending on a speed flag. The
+            # `use_refine_head` switch has to be honoured for the same reason --
+            # omitting it made `--no-refine` a no-op under graph replay.
             mask_logits = model.refine_head(mask_logits, image_norm)
 
         object_score_logits = torch.any(mask_logits.flatten(1) > 0.0, dim=1, keepdim=True).float()

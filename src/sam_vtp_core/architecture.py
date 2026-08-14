@@ -410,13 +410,36 @@ class Hiera(nn.Module):
             embed_dim = dim_out
 
         self.channel_list = [self.blocks[i].dim_out for i in self.stage_ends[::-1]]
+        self._pos_embed_cache: Dict[Any, torch.Tensor] = {}
 
-    def _get_pos_embed(self, hw: Tuple[int, int]) -> torch.Tensor:
-        h, w = hw
+    def _build_pos_embed(self, h: int, w: int) -> torch.Tensor:
         pos_embed = F.interpolate(self.pos_embed, size=(h, w), mode="bicubic")
         pos_embed = pos_embed + self.pos_embed_window.tile(
             [x // y for x, y in zip(pos_embed.shape, self.pos_embed_window.shape)])
         return pos_embed.permute(0, 2, 3, 1)
+
+    def _get_pos_embed(self, hw: Tuple[int, int]) -> torch.Tensor:
+        """The trunk's input position encoding, cached for inference.
+
+        This is a bicubic upsample of a 7x7 parameter to the full stride-4 grid
+        -- 128x128x96 for a 512x512 input -- and it is identical on every frame
+        of a stream. Recomputing it per frame costs a bicubic interpolation and
+        a tile over 1.6M elements for a result that never changes.
+
+        Cached only when weights cannot move underneath it: training updates
+        `pos_embed`, and a grad-enabled eval pass would have the cache hand back
+        a tensor carrying a stale autograd graph. Both fall through to a rebuild.
+        `SAMVTP.clear_inference_caches` drops it when new weights are loaded.
+        """
+        h, w = hw
+        if self.training or torch.is_grad_enabled():
+            return self._build_pos_embed(h, w)
+        key = (h, w, str(self.pos_embed.device), self.pos_embed.dtype)
+        cached = self._pos_embed_cache.get(key)
+        if cached is None:
+            cached = self._build_pos_embed(h, w)
+            self._pos_embed_cache[key] = cached
+        return cached
 
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
         x = self.patch_embed(x)
@@ -1637,6 +1660,8 @@ class SAMVTP(nn.Module):
         # the configuration into its control flow -- can detect that it is stale
         # instead of silently replaying the old one.
         self._component_epoch = 0
+        # Constants derived from weights and grid size; see `_prompt_tensors`.
+        self._prompt_cache: Dict[Any, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
         self.register_buffer("pixel_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer("pixel_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
@@ -1920,6 +1945,60 @@ class SAMVTP(nn.Module):
             shadow[bucket] = dst
         return shadow
 
+    # -- prompt --------------------------------------------------------------
+    def _prompt_tensors(self, pix_feat: torch.Tensor, B: int):
+        """The learned prompt and decoder position encoding, at the feature grid.
+
+        The prompt is a constant of the task rather than a per-frame input (see
+        `LearnedPrompt`), so all three tensors are fixed once the feature grid
+        size is fixed. Both are stored at the 64x64 grid implied by
+        `image_size`, and a 512x512 input decodes at 32x32, so the unconditional
+        path resamples 2 x 256x64x64 on every frame to produce a constant.
+
+        Shared by the eager path and the CUDA-graph runner so the two cannot
+        drift apart. Caching follows the same rule as `Hiera._get_pos_embed`:
+        never while training or with grad live, and dropped by
+        `clear_inference_caches` when weights change.
+        """
+        size = tuple(pix_feat.shape[-2:])
+
+        def build():
+            sparse, dense = self.sam2_model.sam_prompt_encoder(
+                points=None, boxes=None, masks=None)
+            if dense.shape[-2:] != size:
+                dense = F.interpolate(dense, size=size, mode="bilinear", align_corners=False)
+            pe = self.sam2_model.sam_prompt_encoder.get_dense_pe()
+            if pe.shape[-2:] != size:
+                pe = F.interpolate(pe, size=size, mode="bilinear", align_corners=False)
+            return sparse, dense, pe.to(device=pix_feat.device, dtype=pix_feat.dtype)
+
+        if self.training or torch.is_grad_enabled():
+            sparse, dense, pe = build()
+        else:
+            # Keyed on the parameter's device/dtype as well as the feature
+            # grid's: under autocast the two differ, and a `.half()` on the
+            # model would otherwise leave a stale fp32 entry reachable.
+            prompt_param = self.sam2_model.sam_prompt_encoder.dense_emb
+            key = (size, str(pix_feat.device), pix_feat.dtype,
+                   str(prompt_param.device), prompt_param.dtype)
+            cached = self._prompt_cache.get(key)
+            if cached is None:
+                cached = build()
+                self._prompt_cache[key] = cached
+            sparse, dense, pe = cached
+        return sparse.expand(B, -1, -1), dense.expand(B, -1, -1, -1), pe
+
+    def clear_inference_caches(self) -> None:
+        """Drop every cached tensor derived from weights.
+
+        The inference caches hold constants computed from parameters, so they
+        are only valid while those parameters hold still. Anything that can move
+        them -- loading a checkpoint, switching components -- must call this, or
+        the model keeps serving a constant derived from weights it no longer has.
+        """
+        self.sam2_model.image_encoder.trunk._pos_embed_cache.clear()
+        self._prompt_cache.clear()
+
     # -- forward -------------------------------------------------------------
     def forward_frame(
         self,
@@ -2002,19 +2081,7 @@ class SAMVTP(nn.Module):
                 output_dict=output_dict,
             )
 
-        sparse_embeddings, dense_embeddings = self.sam2_model.sam_prompt_encoder(
-            points=None, boxes=None, masks=None)
-        sparse_embeddings = sparse_embeddings.expand(B, -1, -1)
-        dense_embeddings = dense_embeddings.expand(B, -1, -1, -1)
-        if dense_embeddings.shape[-2:] != pix_feat.shape[-2:]:
-            dense_embeddings = F.interpolate(
-                dense_embeddings, size=pix_feat.shape[-2:], mode="bilinear", align_corners=False)
-
-        image_pe = self.sam2_model.sam_prompt_encoder.get_dense_pe()
-        if image_pe.shape[-2:] != pix_feat.shape[-2:]:
-            image_pe = F.interpolate(image_pe, size=pix_feat.shape[-2:],
-                                     mode="bilinear", align_corners=False)
-        image_pe = image_pe.to(device=pix_feat.device, dtype=pix_feat.dtype)
+        sparse_embeddings, dense_embeddings, image_pe = self._prompt_tensors(pix_feat, B)
 
         high_res_feats = [f.permute(1, 2, 0).view(B, -1, *s)
                           for f, s in zip(vision_feats[:-1], feat_sizes[:-1])]
@@ -2148,6 +2215,8 @@ class SAMVTP(nn.Module):
         under the full model's name.
         """
         missing, unexpected = self.load_state_dict(state, strict=False)
+        # New weights invalidate every constant derived from the old ones.
+        self.clear_inference_caches()
         if missing or unexpected:
             lines = ["checkpoint does not match this architecture."]
             if missing:
