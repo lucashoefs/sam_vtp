@@ -21,23 +21,45 @@ def resolve_path(path_like: str) -> Path:
     return Path(path_like).expanduser().resolve()
 
 
-def tune_for_inference() -> str:
-    """Set the process-wide backend flags a fixed-shape deployment wants.
+def tune_for_inference(model: Optional[torch.nn.Module] = None, *,
+                       channels_last: bool = True,
+                       cudnn_benchmark: bool = False) -> str:
+    """Apply the deployment-only speedups that do not change the architecture.
 
-    Kept as an explicit call rather than an import side effect: these are global
-    and they change results. `cudnn.benchmark` times the available convolution
-    algorithms on first use and keeps the fastest, so it needs the shapes to be
-    stable -- true here, and `SAMVTP.warmup` pays the search off the clock -- but
-    a different algorithm rounds differently, so output moves within floating
-    point tolerance rather than staying bit-identical. Do not turn it on for a
-    run whose numbers have to reproduce an earlier one exactly.
+    Explicit rather than an import side effect, and explicit rather than folded
+    into `build_model`, because both of these move results slightly: a different
+    convolution algorithm rounds differently. Do not turn them on for a run whose
+    numbers have to reproduce an earlier one exactly.
+
+    channels_last: NHWC for the whole model. Narrow convolutions are badly
+        served by NCHW -- on an Orin Nano the refinement head's two 3x3
+        convolutions took 9.9 ms in NCHW and 1.6 ms in NHWC -- and the memory
+        encoder and the decoder's transposed convolutions pay the same tax.
+        Measured 50.3 -> 47.4 ms per frame on the whole model. Attention is
+        indifferent to it. On by default because it measured as a clear win with
+        no downside beyond that rounding.
+
+    cudnn_benchmark: time the available convolution algorithms on first use and
+        keep the fastest. Wants stable shapes, which hold here, and `warmup`
+        pays for the search off the clock. OFF by default: it measured as
+        exactly neutral on the refinement head (14.084 vs 14.081 ms,
+        bit-identical output), so it is unproven on this model and an unproven
+        source of run-to-run variation is not worth taking for free.
 
     Returns a one-line description, worth logging next to the model banner.
     """
     if not torch.cuda.is_available():
         return "tune_for_inference: no CUDA, nothing to set"
-    torch.backends.cudnn.benchmark = True
-    return "tune_for_inference: cudnn.benchmark=True (fixed shapes; not bit-exact)"
+    notes = []
+    if cudnn_benchmark:
+        torch.backends.cudnn.benchmark = True
+        notes.append("cudnn.benchmark=True")
+    if channels_last and model is not None:
+        model.to(memory_format=torch.channels_last)
+        notes.append("channels_last")
+    elif channels_last:
+        notes.append("channels_last SKIPPED (no model passed)")
+    return f"tune_for_inference: {', '.join(notes) or 'nothing enabled'} (not bit-exact)"
 
 
 def load_checkpoint_state(path: str, map_location: str = "cpu") -> Dict[str, Any]:

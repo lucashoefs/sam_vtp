@@ -38,6 +38,11 @@ def main() -> int:
     ap.add_argument("--tolerance", type=float, default=1e-3)
     ap.add_argument("--rgb-only", action="store_true",
                     help="force warp_memory and use_geometry off")
+    ap.add_argument("--channels-last", action="store_true",
+                    help="run both models in NHWC, checking that graph capture "
+                         "still agrees with eager in that layout. This does NOT "
+                         "measure what the layout does to the mask -- for that, "
+                         "evaluate NCHW against NHWC on real footage")
     ap.add_argument("--memory-write-every", type=int, default=1,
                     help="write to the bank every k-th frame. >1 exercises the "
                          "second captured graph, and checks that the cadence "
@@ -64,6 +69,8 @@ def main() -> int:
         if a.rgb_only:
             m.warp_memory = m.use_geometry = False
         m.memory_write_every = max(1, int(a.memory_write_every))
+        if a.channels_last:
+            m.to(memory_format=torch.channels_last)
         return m
 
     torch.manual_seed(0)
