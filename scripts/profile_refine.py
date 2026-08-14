@@ -217,6 +217,51 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001
         print(f"  {'torch.compile':34s} failed: {type(exc).__name__}")
 
+    # 6. GroupNorm(1, C) is a whole-tensor reduction, and NHWC makes it worse:
+    # with one group the reduction spans every channel, which is contiguous in
+    # NCHW and strided in NHWC. But mu and sigma are per-SAMPLE scalars, so once
+    # they exist the rest is a per-channel affine -- one reduction pass and one
+    # elementwise pass, whatever the layout. Algebraically identical to
+    # F.group_norm; measured at 1.8e-07 relative on CPU, i.e. fp32 rounding.
+    gn = head_cl.stem[1]
+
+    def gn_fused(x):
+        var, mean = torch.var_mean(x, dim=(1, 2, 3), keepdim=True, unbiased=False)
+        scale = gn.weight.view(1, -1, 1, 1) * torch.rsqrt(var + gn.eps)
+        return torch.addcmul(gn.bias.view(1, -1, 1, 1) - mean * scale, x, scale)
+
+    print("\n--- GroupNorm(1, C) alone " + "-" * 41)
+    with torch.no_grad(), amp:
+        x_nchw = torch.randn(1, a.channels, S, S, device=dev)
+        x_nhwc = x_nchw.contiguous(memory_format=torch.channels_last)
+        x_half = x_nhwc.half()
+        gn_ref = gn(x_nhwc).float()
+        for label, fn, probe in (
+                ("F.group_norm NCHW", lambda: gn(x_nchw), x_nchw),
+                ("F.group_norm NHWC", lambda: gn(x_nhwc), x_nhwc),
+                ("F.group_norm NHWC fp16", lambda: gn(x_half), x_half),
+                ("var_mean + addcmul NHWC", lambda: gn_fused(x_nhwc), x_nhwc),
+                ("var_mean + addcmul fp16", lambda: gn_fused(x_half), x_half)):
+            ms = timed(fn, a.frames)
+            d = (fn().float() - gn_ref).abs().max().item()
+            print(f"  {label:28s} {ms:7.3f} ms   max|diff| {d:9.3e}")
+
+    # 7. everything that measured well, together
+    def best():
+        with torch.no_grad(), amp:
+            x = torch.cat([image_f32, logits_f16], dim=1).contiguous(
+                memory_format=torch.channels_last)
+            x = head_cl.stem[0](x)
+            x = gn_fused(x)
+            x = head_cl.stem[2](x)
+            x = head_cl.stem[3](x)
+            x = head_cl.stem[4](x)
+            return logits_f16 + head_cl.out(x)
+
+    print()
+    print(f"  {'variant':34s} {'ms':>8} {'vs base':>9}  {'max|diff|':>10}")
+    report("channels_last + fused GroupNorm", best)
+
     # -- layer by layer again, in the best layout ----------------------------
     print("\n--- inside the head, channels_last " + "-" * 33)
     with torch.no_grad(), amp:
