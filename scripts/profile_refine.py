@@ -137,7 +137,10 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001
             print(f"  {label:34s} failed: {type(exc).__name__}: {exc}")
 
-    # 1. kill the fp32 promotion: match dtypes before the cat
+    # 1. kill the fp32 promotion: match dtypes before the cat.
+    # Measured a dead end -- autocast already casts for the convolution, so
+    # moving the cast earlier is bit-identical and just as slow. Kept so a
+    # future reader does not re-derive it.
     image_f16 = image_f32.half()
 
     def half_input():
@@ -145,35 +148,84 @@ def main() -> int:
             return head(logits_f16, image_f16)
     report("fp16 image (no cat promotion)", half_input)
 
-    # 2. channels_last: C=4 and C=8 become the contiguous axis
+    # 2. let cuDNN choose its algorithm by measurement rather than by heuristic.
+    # These channel counts are exactly the case its heuristics are worst at, and
+    # shapes here are fixed for the life of the process.
+    torch.backends.cudnn.benchmark = True
+    report("cudnn.benchmark", baseline)
+
+    # 3. channels_last: C=4 and C=8 become the contiguous axis.
+    #
+    # The conversion of the two inputs is INSIDE the timed region on purpose.
+    # The model hands this head NCHW tensors, so a deployment pays that
+    # transpose every frame; pre-converting it outside the loop would report a
+    # speedup the robot never sees.
     head_cl = RefinementHead(channels=a.channels).to(dev).eval()
     head_cl.load_state_dict(head.state_dict())
     head_cl = head_cl.to(memory_format=torch.channels_last)
-    img_cl = image_f32.to(memory_format=torch.channels_last)
-    log_cl = logits_f16.to(memory_format=torch.channels_last)
 
     def chlast():
         with torch.no_grad(), amp:
-            return head_cl(log_cl, img_cl)
-    report("channels_last", chlast)
+            return head_cl(logits_f16.contiguous(memory_format=torch.channels_last),
+                           image_f32.contiguous(memory_format=torch.channels_last))
+    report("channels_last (+ conversion)", chlast)
 
-    img_cl16 = image_f16.to(memory_format=torch.channels_last)
+    log_pre = logits_f16.contiguous(memory_format=torch.channels_last)
+    img_pre = image_f32.contiguous(memory_format=torch.channels_last)
 
-    def chlast_half():
+    def chlast_pre():
         with torch.no_grad(), amp:
-            return head_cl(log_cl, img_cl16)
-    report("channels_last + fp16 image", chlast_half)
+            return head_cl(log_pre, img_pre)
+    report("channels_last (already NHWC)", chlast_pre)
 
-    # 3. let inductor fuse the norm/activation chain
+    torch.backends.cudnn.benchmark = False
+    report("channels_last, no cudnn.benchmark", chlast)
+    torch.backends.cudnn.benchmark = True
+
+    # 4. pad the 4-channel input to 8. cuDNN's fp16 tensor-core kernels want a
+    # channel count that tiles by 8, and 4 cannot use them at all. The added
+    # taps multiply by zero, so this is mathematically the same convolution;
+    # measured at one fp32 ulp (2.4e-07) on CPU, since four extra zero terms
+    # still change the accumulation order.
+    with torch.no_grad():
+        head_pad = RefinementHead(channels=a.channels).to(dev).eval()
+        head_pad.load_state_dict(head.state_dict())
+        c0 = head_pad.stem[0]
+        wide = torch.nn.Conv2d(8, a.channels, 3, padding=1).to(dev)
+        wide.weight.zero_()
+        wide.weight[:, :4].copy_(c0.weight)
+        wide.bias.copy_(c0.bias)
+        head_pad.stem[0] = wide
+        head_pad = head_pad.to(memory_format=torch.channels_last)
+
+    def padded():
+        with torch.no_grad(), amp:
+            x = torch.cat([image_f32, logits_f16.float(),
+                           image_f32.new_zeros(1, 4, S, S)], dim=1)
+            x = x.contiguous(memory_format=torch.channels_last)
+            return logits_f16 + head_pad.out(head_pad.stem(x))
+    report("channels_last + 4->8 padded in", padded)
+
+    # 5. let inductor fuse the norm/activation chain into the convolutions
     try:
-        compiled = torch.compile(head, dynamic=False)
+        compiled = torch.compile(head_cl, dynamic=False)
 
         def comp():
             with torch.no_grad(), amp:
-                return compiled(logits_f16, image_f32)
-        report("torch.compile", comp)
+                return compiled(log_pre, img_pre)
+        report("torch.compile + channels_last", comp)
     except Exception as exc:  # noqa: BLE001
-        print(f"  {'torch.compile':34s} unavailable: {type(exc).__name__}")
+        print(f"  {'torch.compile':34s} failed: {type(exc).__name__}")
+
+    # -- layer by layer again, in the best layout ----------------------------
+    print("\n--- inside the head, channels_last " + "-" * 33)
+    with torch.no_grad(), amp:
+        cur = torch.cat([image_f32, logits_f16], dim=1).contiguous(
+            memory_format=torch.channels_last)
+        for i, layer in enumerate(head_cl.stem):
+            ms = timed((lambda m, t: (lambda: m(t)))(layer, cur), a.frames)
+            print(f"  stem[{i}] {type(layer).__name__:22s} {ms:7.3f} ms")
+            cur = layer(cur)
 
     print("\nA variant is only worth taking if its disagreement is small next to")
     print("the residual the head is adding in the first place. Print that scale")

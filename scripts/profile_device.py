@@ -374,6 +374,12 @@ def main() -> int:
     ap.add_argument("--amp", choices=["fp16", "bf16", "fp32"], default="fp16")
     ap.add_argument("--no-graph", action="store_true", help="skip the graph-replay pass")
     ap.add_argument("--skip-stages", action="store_true")
+    ap.add_argument("--cudnn-benchmark", action="store_true",
+                    help="let cuDNN pick convolution algorithms by measurement "
+                         "(what tune_for_inference does in deployment)")
+    ap.add_argument("--channels-last", action="store_true",
+                    help="run the whole model in NHWC. Narrow convolutions are "
+                         "much better served by it; attention is indifferent")
     ap.add_argument("--skip-ablate", action="store_true",
                     help="skip the switch-a-stage-off pass (it re-captures the "
                          "graph once per stage, so it is the slow part)")
@@ -400,6 +406,13 @@ def main() -> int:
         model = SAMVTP(SAMVTPConfig()).to(dev).eval()
         print("\n(random weights: timing is weight-independent)")
     print(describe(model))
+
+    if args.cudnn_benchmark:
+        torch.backends.cudnn.benchmark = True
+        print("cudnn.benchmark = True")
+    if args.channels_last:
+        model = model.to(memory_format=torch.channels_last)
+        print("model converted to channels_last (NHWC)")
 
     stride = model.sam2_model.backbone_stride
     feat_tokens = (args.height // stride) * (args.width // stride)
