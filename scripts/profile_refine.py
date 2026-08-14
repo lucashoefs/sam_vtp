@@ -74,6 +74,10 @@ def main() -> int:
     S = a.size
     print(f"{torch.cuda.get_device_name(0)} | torch {torch.__version__} | {S}x{S}\n")
 
+    # Seed BEFORE the head is built. Unseeded weights made `max|diff|` and the
+    # residual scale wander between runs, which is exactly the pair of numbers
+    # this script exists to compare.
+    torch.manual_seed(0)
     head = RefinementHead(channels=a.channels).to(dev).eval()
     # Zero-initialised at the output by design, so a trained head is the harder
     # case numerically; give it real weights or every variant agrees trivially.
@@ -81,7 +85,6 @@ def main() -> int:
         torch.nn.init.normal_(head.out.weight, std=0.05)
         torch.nn.init.normal_(head.out.bias, std=0.05)
 
-    torch.manual_seed(0)
     # Exactly the dtypes forward_frame produces under autocast: image_norm stays
     # fp32 because normalisation is elementwise, logits are fp16 from the decoder.
     image_f32 = torch.randn(1, 3, S, S, device=dev, dtype=torch.float32)
