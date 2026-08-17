@@ -1756,13 +1756,35 @@ class SAMVTP(nn.Module):
         }
 
     @property
-    def needs_geometry(self) -> bool:
-        """True when depth and pose are required for the model to behave as trained.
+    def needs_depth(self) -> bool:
+        """True when depth is required for the model to behave as trained.
 
-        The warp only acts when memory is read, so with memory switched off it
-        stops being a reason to demand depth and pose.
+        Both consumers need it: the geometry channels derive from it, and the
+        warp reprojects through it. The warp only acts when memory is read, so
+        with memory switched off it stops being a reason to demand anything.
         """
         return bool(self.use_geometry or (self.warp_memory and self.use_memory))
+
+    @property
+    def needs_pose(self) -> bool:
+        """True when pose is required. ONLY the warp needs it.
+
+        Kept separate from `needs_depth` because conflating them makes a
+        geometry-only model demand a camera pose it never reads, and so makes it
+        depend on localisation it does not actually use. The geometry channels
+        are a function of depth and intrinsics alone -- log depth, slope,
+        roughness, height, validity -- and none of them asks where the camera
+        was.
+        """
+        return bool(self.warp_memory and self.use_memory)
+
+    @property
+    def needs_geometry(self) -> bool:
+        """Deprecated alias for `needs_depth`; prefer the two properties above.
+
+        Kept because callers outside this repo test it before supplying inputs.
+        """
+        return self.needs_depth
 
     # -- component switches --------------------------------------------------
     #
@@ -1915,9 +1937,10 @@ class SAMVTP(nn.Module):
         dtype = next(self.parameters()).dtype
         image = torch.zeros(1, 3, int(hw[0]), int(hw[1]), device=device, dtype=dtype)
         depth = pose = None
-        if self.needs_geometry:
+        if self.needs_depth:
             depth = torch.full((1, 1, int(hw[0]), int(hw[1])), 5.0,
                                device=device, dtype=dtype)
+        if self.needs_pose:
             pose = torch.zeros(1, 7, device=device, dtype=dtype)
             pose[0, 6] = 1.0
         was_training = self.training
@@ -2093,12 +2116,19 @@ class SAMVTP(nn.Module):
                 is missing. Running without them is not a graceful degradation --
                 it silently disables the alignment the weights were fitted with.
         """
-        if self.needs_geometry and (depth is None or pose is None):
+        if self.needs_depth and depth is None:
             raise ValueError(
                 "this checkpoint was trained with warp_memory/use_geometry, so it "
-                "needs depth (metres) and pose per frame. Pass them, or call "
+                "needs depth in METRES per frame. Pass it, or call "
                 "model.set_components(warp=False, geometry=False) to run the "
                 "RGB-only ablation deliberately.")
+        if self.needs_pose and pose is None:
+            raise ValueError(
+                "this checkpoint was trained with warp_memory, so it needs a "
+                "camera pose per frame to align the memory. Pass it, or call "
+                "model.set_components(warp=False) to run without alignment "
+                "deliberately -- note that changes what the weights were fitted "
+                "with.")
 
         B, _, H, W = image.shape
         image_norm = self.normalize_imagenet(image)

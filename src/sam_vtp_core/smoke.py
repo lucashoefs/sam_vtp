@@ -41,8 +41,9 @@ def main() -> int:
     images = torch.randint(0, 256, (1, T, 3, H, W), device=device).float()
 
     depth = pose = None
-    if model.needs_geometry:
+    if model.needs_depth:
         depth = torch.rand(1, T, 1, H, W, device=device) * 20.0 + 1.0
+    if model.needs_pose:
         pose = torch.zeros(1, T, 7, device=device)
         pose[..., 6] = 1.0
         pose[:, :, 0] = torch.arange(T, device=device, dtype=torch.float32) * 0.2

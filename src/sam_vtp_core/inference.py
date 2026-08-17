@@ -211,12 +211,19 @@ def infer_sequence(
     if not image_paths:
         raise ValueError("image_paths must not be empty")
 
-    needs_geom = model.needs_geometry
-    if needs_geom and (depth_paths is None or poses is None):
+    needs_geom = model.needs_depth
+    if needs_geom and depth_paths is None:
         raise ValueError(
-            "this checkpoint uses depth and pose (warp_memory/use_geometry). Pass "
-            "depth_paths and poses, or disable both on the model to run the "
-            "RGB-only ablation deliberately.")
+            "this checkpoint uses depth (warp_memory/use_geometry). Pass "
+            "depth_paths, or disable both on the model to run the RGB-only "
+            "ablation deliberately.")
+    # Pose is the warp's requirement alone: a geometry-only checkpoint reads
+    # depth and intrinsics and never asks where the camera was, so demanding a
+    # trajectory from it would impose a localisation dependency it does not have.
+    if model.needs_pose and poses is None:
+        raise ValueError(
+            "this checkpoint uses warp_memory, so it needs a pose per frame. "
+            "Pass poses, or disable the warp on the model deliberately.")
     if depth_paths is not None and len(depth_paths) != len(image_paths):
         raise ValueError(f"{len(depth_paths)} depth maps for {len(image_paths)} images")
     if poses is not None and len(poses) < len(image_paths):
