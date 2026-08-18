@@ -2,7 +2,7 @@
 
     from sam_vtp_core import build_model
     model = build_model("sam_vtp.pt", device="cuda")
-    out = model.forward_frame(rgb, is_init_frame=True, depth=depth, pose=pose)
+    out = model.forward_frame(rgb, is_init_frame=True, depth=depth)
     traversability = out["logits"].sigmoid()
 
 The network is defined end to end in `architecture.py` and depends only on
@@ -12,16 +12,10 @@ separately, since it needs OpenCV and is only used to build training data.
 
 from .architecture import (
     CameraIntrinsics,
-    Q_FLU_TO_NED_BODY,
-    Q_OPTICAL_TO_NED_BODY,
     SAMVTP,
     SAMVTPConfig,
     TARTANGROUND,
     geometry_channels,
-    pose_from_flu,
-    pose_from_optical,
-    quat_mul,
-    warp_features,
 )
 from .factory import (
     build_model,
@@ -38,7 +32,6 @@ from .inference import (
     infer_sequence,
     list_depths,
     list_images,
-    load_poses,
     read_depth_metres,
 )
 from .stream import SAMVTPStreamProcessor, StreamStepResult, run_stream_loop
@@ -51,12 +44,6 @@ __all__ = [
     "CameraIntrinsics",
     "TARTANGROUND",
     "geometry_channels",
-    "warp_features",
-    "pose_from_optical",
-    "pose_from_flu",
-    "quat_mul",
-    "Q_OPTICAL_TO_NED_BODY",
-    "Q_FLU_TO_NED_BODY",
     "depth_from_uint16_mm",
     "build_model",
     "describe",
@@ -67,7 +54,6 @@ __all__ = [
     "infer_sequence",
     "list_images",
     "list_depths",
-    "load_poses",
     "read_depth_metres",
     "compatible_input_hw",
     "SAMVTPStreamProcessor",

@@ -4,33 +4,23 @@ Everything you need to run SAM-VTP on a real camera. The [README](../README.md)
 covers the API; this covers the conventions that produce a plausible but wrong
 map when violated.
 
-## Pose
+## Camera intrinsics
 
-Only the *relative* transform between two frames is ever used, and that is
-invariant to the frame the poses are expressed in, so ROS `odom` is fine and
-there is no need to convert ENU to NED. What matters is the camera axis
-convention, and the helpers handle it:
+The model takes **no pose, odometry or TF lookup of any kind**: the geometry
+channels are a function of depth and intrinsics alone. Supply your own
+intrinsics, at the resolution they were calibrated at.
 
 ```python
-from sam_vtp_core import CameraIntrinsics, build_model, pose_from_optical
+from sam_vtp_core import CameraIntrinsics, build_model
 
 cam = CameraIntrinsics.from_K(camera_info.k, width=848, height=480)   # NATIVE resolution
 model = build_model("sam_vtp.pt", device=dev, camera=cam)
 model.warmup()                       # pay lazy CUDA init before the robot is live
-
-# TF: odom -> <camera>_color_optical_frame, looked up AT THE IMAGE TIMESTAMP
-tf = buffer.lookup_transform("odom", "d455_color_optical_frame", img.header.stamp)
-t, q = tf.transform.translation, tf.transform.rotation
-pose = pose_from_optical([t.x, t.y, t.z], [q.x, q.y, q.z, q.w])
 ```
 
-`pose_from_flu` exists for a REP-103 body frame, but prefer the optical frame:
-the translation must belong to the same frame as the rotation, and a base-link
-position with a camera rotation carries a lever-arm error that does not cancel
-when the robot turns.
-
-Sample the pose at the **image timestamp**, not at processing time. At 0.5 m/s,
-60 ms of skew is 3 cm, which shows up as smearing in the warped memory.
+The default is the TartanGround simulator camera (640x640, 90 degree FOV), which
+is almost certainly not yours; wrong intrinsics tilt every slope and misscale
+every height while still looking plausible.
 
 ## Depth
 
@@ -38,7 +28,7 @@ Sample the pose at the **image timestamp**, not at processing time. At 0.5 m/s,
 from sam_vtp_core import depth_from_uint16_mm
 
 depth_m, valid = depth_from_uint16_mm(aligned_depth_16uc1)   # 0 means no return
-result = stream.step(rgb, depth=depth_m, pose=pose, depth_valid=valid)
+result = stream.step(rgb, depth=depth_m, depth_valid=valid)
 ```
 
 Non-positive depths are already treated as missing, so `depth_valid` is for
@@ -71,8 +61,8 @@ resize is then anisotropic on purpose, which is what equalises the two normalise
 focal lengths.
 
 None of the three is free, and which one wins is empirical on your camera. The
-frame-to-frame stability metric (warp *t-1* into *t*, compare with *t*) ranks them
-on your own footage without needing any labels.
+frame-to-frame stability metric (compare the prediction at *t-1* with the one at
+*t*) ranks them on your own footage without needing any labels.
 
 ## Image range
 

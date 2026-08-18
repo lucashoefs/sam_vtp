@@ -228,7 +228,7 @@ def timed(fn, n: int, dev: torch.device) -> List[float]:
     return out
 
 
-def stage_breakdown(model: SAMVTP, img, dep, pose, dev, n: int) -> None:
+def stage_breakdown(model: SAMVTP, img, dep, dev, n: int) -> None:
     """Per-stage cost, each stage synchronised.
 
     Synchronising after every stage serialises work the GPU would otherwise
@@ -258,13 +258,10 @@ def stage_breakdown(model: SAMVTP, img, dep, pose, dev, n: int) -> None:
                 geo.to(top.dtype), top.shape[-2:])
 
         vf, vp, fs = core.prepare_backbone_features(backbone_out)
-        if model.warp_memory:
-            stages["memory warp"] = lambda: model._warped_output_dict(dep, pose, fs[-1])
-        shadow = (model._warped_output_dict(dep, pose, fs[-1])
-                  if model.warp_memory else model.output_dict)
         stages["memory attention"] = lambda: core.prepare_memory_conditioned_features(
             frame_idx=model.frame_idx, current_vision_feats=[vf[-1]],
-            current_vision_pos_embeds=[vp[-1]], feat_sizes=[fs[-1]], output_dict=shadow)
+            current_vision_pos_embeds=[vp[-1]], feat_sizes=[fs[-1]],
+            output_dict=model.output_dict)
 
         pix = core.prepare_memory_conditioned_features(
             frame_idx=model.frame_idx, current_vision_feats=[vf[-1]],
@@ -320,12 +317,11 @@ def replay_cost_by_component(model, dev, mk, frames: int) -> None:
     print("\n--- cost under graph replay, by switching stages off " + "-" * 19)
     have = {"refine": model.refine_head is not None and model.use_refine_head,
             "geometry": model.geometry_encoder is not None and model.use_geometry,
-            "warp": model.no_corr_embed is not None and model.warp_memory}
+            }
 
     def measure(label: str, **switches) -> Optional[float]:
         previous = {k: getattr(model, {"refine": "use_refine_head",
-                                       "geometry": "use_geometry",
-                                       "warp": "warp_memory"}[k])
+                                       "geometry": "use_geometry"}[k])
                     for k in switches}
         try:
             model.set_components(**switches)
@@ -333,14 +329,14 @@ def replay_cost_by_component(model, dev, mk, frames: int) -> None:
             runner = SAMVTPFullGraphReplayRunner(model, dev, enabled=True,
                                                  capture_warmup=2)
             for t in range(max(20, runner.min_history_frames + 3)):
-                img, dep, pose = mk(t)
-                runner.run(img, is_init_frame=(t == 0), depth=dep, pose=pose)
+                img, dep = mk(t)
+                runner.run(img, is_init_frame=(t == 0), depth=dep)
             if not runner._captured:
                 print(f"  {label:24s} capture did not engage; skipped")
                 return None
-            img, dep, pose = mk(99)
+            img, dep = mk(99)
             ms = statistics.median(timed(
-                lambda: runner.run(img, is_init_frame=False, depth=dep, pose=pose),
+                lambda: runner.run(img, is_init_frame=False, depth=dep),
                 frames, dev))
             return ms
         finally:
@@ -354,7 +350,7 @@ def replay_cost_by_component(model, dev, mk, frames: int) -> None:
         for name, on in have.items():
             if not on:
                 continue
-            key = {"refine": "refine", "geometry": "geometry", "warp": "warp"}[name]
+            key = {"refine": "refine", "geometry": "geometry"}[name]
             off = measure(f"{name} off", **{key: False})
             if off is None:
                 continue
@@ -432,19 +428,16 @@ def main() -> int:
     def mk(t):
         img = torch.rand(1, 3, args.height, args.width, device=dev) * 255
         dep = torch.rand(1, 1, args.height, args.width, device=dev) * 20 + 1.0
-        pose = torch.zeros(1, 7, device=dev)
-        pose[0, 6] = 1.0
-        pose[0, 0] = 0.2 * t
-        return img, dep, pose
+        return img, dep
 
     print("\n--- end to end " + "-" * 57)
     with torch.no_grad(), ctx:
         model.reset_memory()
         for t in range(20):                      # fill bank + warm caches/algos
-            img, dep, pose = mk(t)
-            model.forward_frame(img, is_init_frame=(t == 0), depth=dep, pose=pose)
-        img, dep, pose = mk(20)
-        eager = timed(lambda: model.forward_frame(img, depth=dep, pose=pose),
+            img, dep = mk(t)
+            model.forward_frame(img, is_init_frame=(t == 0), depth=dep)
+        img, dep = mk(20)
+        eager = timed(lambda: model.forward_frame(img, depth=dep),
                       args.frames, dev)
         med = statistics.median(eager)
         scale = (args.height * args.width) / (512 * 512)
@@ -456,11 +449,11 @@ def main() -> int:
             model.reset_memory()
             runner = SAMVTPFullGraphReplayRunner(model, dev, enabled=True, capture_warmup=2)
             for t in range(max(20, runner.min_history_frames + 3)):
-                img, dep, pose = mk(t)
-                runner.run(img, is_init_frame=(t == 0), depth=dep, pose=pose)
+                img, dep = mk(t)
+                runner.run(img, is_init_frame=(t == 0), depth=dep)
             print(f"  graph status    {runner.status_note()}")
-            img, dep, pose = mk(99)
-            g = timed(lambda: runner.run(img, is_init_frame=False, depth=dep, pose=pose),
+            img, dep = mk(99)
+            g = timed(lambda: runner.run(img, is_init_frame=False, depth=dep),
                       args.frames, dev)
             gmed = statistics.median(g)
             print(f"  graph replay    {gmed:7.2f} ms  {1000 / gmed:6.2f} FPS  "
@@ -473,10 +466,10 @@ def main() -> int:
         model.reset_memory()
         with torch.no_grad(), ctx:
             for t in range(20):
-                img, dep, pose = mk(t)
-                model.forward_frame(img, is_init_frame=(t == 0), depth=dep, pose=pose)
-            img, dep, pose = mk(20)
-            stage_breakdown(model, img, dep, pose, dev, max(20, args.frames // 4))
+                img, dep = mk(t)
+                model.forward_frame(img, is_init_frame=(t == 0), depth=dep)
+            img, dep = mk(20)
+            stage_breakdown(model, img, dep, dev, max(20, args.frames // 4))
 
     print(f"\nFLOP budget at {args.height}x{args.width}: {gf:.1f} GFLOP/frame "
           f"(53% image encoder, 42% memory attention, 5% everything else)")

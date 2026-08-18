@@ -8,7 +8,7 @@ same sequence through both and reports the largest disagreement, so a change to
 than as quietly different results whenever the speed flag is on.
 
 Both are run in the model's own configuration, so a geometry checkpoint tests
-the warp and geometry encoder inside the graph. `--rgb-only` forces the
+the geometry encoder inside the graph. `--rgb-only` forces the
 ablation configuration instead.
 
     python scripts/verify_fullgraph_parity.py --checkpoint sam_vtp.pt
@@ -37,7 +37,7 @@ def main() -> int:
     ap.add_argument("--size", type=int, default=512)
     ap.add_argument("--tolerance", type=float, default=1e-3)
     ap.add_argument("--rgb-only", action="store_true",
-                    help="force warp_memory and use_geometry off")
+                    help="force use_geometry off")
     ap.add_argument("--channels-last", action="store_true",
                     help="run both models in NHWC, checking that graph capture "
                          "still agrees with eager in that layout. This does NOT "
@@ -67,7 +67,7 @@ def main() -> int:
             torch.manual_seed(1234)
             m = SAMVTP(SAMVTPConfig()).to(device).eval()
         if a.rgb_only:
-            m.warp_memory = m.use_geometry = False
+            m.use_geometry = False
         m.memory_write_every = max(1, int(a.memory_write_every))
         if a.channels_last:
             m.to(memory_format=torch.channels_last)

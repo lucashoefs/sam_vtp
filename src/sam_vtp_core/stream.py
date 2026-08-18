@@ -302,7 +302,6 @@ class SAMVTPStreamProcessor:
     # -- stepping ------------------------------------------------------------
     def step(self, frame: FrameInput,
              depth: Optional[FrameInput] = None,
-             pose: Optional[FrameInput] = None,
              depth_valid: Optional[FrameInput] = None) -> StreamStepResult:
         """Process one frame.
 
@@ -310,10 +309,6 @@ class SAMVTPStreamProcessor:
             frame: RGB, in the range the model's `input_normalization_mode` names.
             depth: metric planar z-depth in METRES, resized to match `frame` if
                 it does not already.
-            pose: `[x y z qx qy qz qw]` scalar-last. Build it with
-                `pose_from_optical` from a TF lookup **at the image timestamp**,
-                not at processing time: at 0.5 m/s, 60 ms of skew is 3 cm, which
-                shows up as smearing in the warped memory.
             depth_valid: optional mask; see `SAMVTP.forward_frame`.
         """
         x = _upload(self._to_bchw(frame, device=self.device), self.device)
@@ -363,10 +358,6 @@ class SAMVTPStreamProcessor:
                 dv = F.interpolate(dv, size=(th, tw), mode="nearest-exact")
 
         out_h, out_w = int(x.shape[-2]), int(x.shape[-1])
-        p = None
-        if pose is not None:
-            p = (torch.as_tensor(pose, dtype=torch.float32)
-                 .reshape(1, 7).to(self.device, non_blocking=True))
 
         proc_h, proc_w = compatible_input_hw(self.model, out_h, out_w)
         if (proc_h, proc_w) != (out_h, out_w):
@@ -391,7 +382,7 @@ class SAMVTPStreamProcessor:
                        if self._use_cuda_amp else nullcontext())
         with torch.no_grad(), amp_context:
             out = self._runner.run(x, is_init_frame=is_init, update_memory=update_memory,
-                                   depth=d, pose=p, depth_valid=dv)
+                                   depth=d, depth_valid=dv)
 
         if self.device.type == "cuda" and self.time_model_only:
             torch.cuda.synchronize(self.device)
@@ -425,8 +416,8 @@ class SAMVTPStreamProcessor:
                  max_frames: Optional[int] = None) -> int:
         """Pull frames until the provider returns None.
 
-        The provider may return a bare RGB frame, or a `(frame, depth, pose)` /
-        `(frame, depth, pose, depth_valid)` tuple.
+        The provider may return a bare RGB frame, or a `(frame, depth)` /
+        `(frame, depth, depth_valid)` tuple.
         """
         processed = 0
         while True:
@@ -443,7 +434,7 @@ class SAMVTPStreamProcessor:
 
 
 def _unpack(item: object):
-    """Accept a bare frame, or a (frame, depth, pose[, depth_valid]) tuple."""
+    """Accept a bare frame, or a (frame, depth[, depth_valid]) tuple."""
     if isinstance(item, (tuple, list)) and not torch.is_tensor(item):
         return tuple(item)
     return (item,)

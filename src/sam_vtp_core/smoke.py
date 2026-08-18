@@ -2,7 +2,7 @@
 
 Runs a short synthetic sequence rather than a single frame, because the failures
 worth catching -- a mismatched memory width, a wrongly inferred architecture,
-missing depth or pose -- only appear once memory is read back.
+missing depth -- only appear once memory is read back.
 """
 
 from __future__ import annotations
@@ -40,16 +40,12 @@ def main() -> int:
     T, H, W = int(args.frames), int(args.height), int(args.width)
     images = torch.randint(0, 256, (1, T, 3, H, W), device=device).float()
 
-    depth = pose = None
+    depth = None
     if model.needs_depth:
         depth = torch.rand(1, T, 1, H, W, device=device) * 20.0 + 1.0
-    if model.needs_pose:
-        pose = torch.zeros(1, T, 7, device=device)
-        pose[..., 6] = 1.0
-        pose[:, :, 0] = torch.arange(T, device=device, dtype=torch.float32) * 0.2
 
     with torch.no_grad():
-        out = model(images, depth_sequence=depth, pose_sequence=pose)
+        out = model(images, depth_sequence=depth)
 
     logits = out["logits"]
     probs = torch.sigmoid(logits)

@@ -6,9 +6,9 @@ for a given platform, so fresh asphalt and a 25 degree gravel slope don't
 collapse to the same "drivable" label.
 
 The model keeps a short memory across frames so the prediction stays stable while
-the camera moves. That memory is resampled into the current camera frame using
-depth and relative pose, so a stored token and the pixel it informs describe the
-same piece of world rather than just the same image coordinate.
+the camera moves, and reads it with attention over content rather than over image
+coordinates. It takes RGB and metric depth; it needs no pose, odometry or
+localisation of any kind.
 
 Two parts: **the model** (`src/sam_vtp_core/`), defined end to end in one file
 depending only on PyTorch, and **the label pipeline**
@@ -37,24 +37,23 @@ from sam_vtp_core import build_model
 model = build_model("sam_vtp.pt", device=torch.device("cuda"))
 
 model.reset_memory()                     # between independent sequences
-for t, (rgb, depth, pose) in enumerate(stream):
+for t, (rgb, depth) in enumerate(stream):
     out = model.forward_frame(rgb,       # (1,3,H,W) RGB in [0,255]
                               is_init_frame=(t == 0),
-                              depth=depth,   # (1,1,H,W) planar z-depth, METRES
-                              pose=pose)     # (1,7) [x y z qx qy qz qw], NED
+                              depth=depth)   # (1,1,H,W) planar z-depth, METRES
     traversability = out["logits"].sigmoid()   # (1,1,H,W) in [0,1]
 ```
 
 A whole clip at once:
 
 ```python
-out = model(images, depth_sequence=depths, pose_sequence=poses)   # (B,T,...)
+out = model(images, depth_sequence=depths)   # (B,T,...)
 ```
 
 Command line:
 
 ```bash
-sam-vtp-infer --images-dir frames/ --depth-dir depth/ --poses poses.txt \
+sam-vtp-infer --images-dir frames/ --depth-dir depth/ \
               --checkpoint sam_vtp.pt --output-dir predictions/ \
               --height 512 --width 512
 ```
@@ -73,23 +72,22 @@ from sam_vtp_core import SAMVTPStreamProcessor
 stream = SAMVTPStreamProcessor(model, resize_hw=(512, 512), threshold=0.5,
                                input_fit="pad", return_numpy=True)
 while (frame := grab()) is not None:
-    result = stream.step(frame.rgb, depth=frame.depth, pose=frame.pose)
+    result = stream.step(frame.rgb, depth=frame.depth)
     if result.memory_fill_level < 1.0:
         continue                       # bank still filling
     plan(result.probabilities)         # (H, W) numpy array
 ```
 
-See [`docs/integration.md`](docs/integration.md) for camera intrinsics, pose
-helpers, aspect-ratio fitting and memory cadence.
+See [`docs/integration.md`](docs/integration.md) for camera intrinsics,
+aspect-ratio fitting and memory cadence.
 
 ## Component switches
 
-Four parts can be switched off at runtime:
+Three parts can be switched off at runtime:
 
 | Switch | Off means |
 |---|---|
 | `memory` | frame-wise; every frame predicted from scratch, bank never read or written |
-| `warp` | memory read without ego-motion alignment |
 | `geometry` | RGB-only; no depth-derived feature |
 | `refine` | no residual refinement head |
 
@@ -101,8 +99,7 @@ with model.components(geometry=False):        # temporary, restored on exit
     rgb_only = model.forward_frame(rgb, is_init_frame=True)
 ```
 
-`--no-memory`, `--no-warp`, `--no-geometry` and `--no-refine` do the same on the
-CLI.
+`--no-memory`, `--no-geometry` and `--no-refine` do the same on the CLI.
 
 A switch selects which of the checkpoint's weights are *used*; it cannot add a
 component the checkpoint lacks, and `set_components` raises rather than running a randomly-initialised module. Turning one off is a deliberate ablation, not a neutral setting: the remaining weights were fitted alongside it and now run outside their training distribution. `describe(model)` appends an explicit `[ABLATED: ...]` clause whenever the active configuration differs from the as-trained one, so a log line distinguishes the two.
@@ -117,20 +114,20 @@ downstream can detect it. Worth checking once at integration time.
 
 | Input | Requirement | If it's wrong |
 |---|---|---|
-| **Depth** | Planar z-depth along the optical axis, in **metres** | The geometry channels and the warp are metric. Millimetres are off by 1000x, normalised `[0,1]` depth is meaningless. |
-| **Pose** | `[x y z qx qy qz qw]`, scalar-**last**, rotating **NED-body camera axes** (x forward, y right, z down) into a **consistent** world frame | A scalar-first quaternion, or FLU/optical axes passed straight through, loads fine and rotates the memory wrongly every frame. |
+| **Depth** | Planar z-depth along the optical axis, in **metres** | The geometry channels are metric. Millimetres are off by 1000x, normalised `[0,1]` depth is meaningless. |
 | **Intrinsics** | Yours, at the resolution they were calibrated at | The default is the TartanGround simulator camera (640x640, 90 degree FOV). Wrong intrinsics tilt every slope and shift every correspondence. |
 
-The world frame is arbitrary, only relative transforms are used, so ROS `odom`
-is fine. A geometry checkpoint run without depth or pose raises rather than
-quietly falling back.
+**No pose or odometry is required anywhere.** The geometry channels are a
+function of depth and intrinsics alone, so the perception stack carries no
+localisation dependency. A geometry checkpoint run without depth raises rather
+than quietly falling back.
 
 ## How it works
 
 <p align="center"><img src="docs/architecture.png" width="100%" alt="SAM-VTP architecture"></p>
 
-RGB and depth are encoded and summed, memory is warped into the current frame
-before it's fused, and the decoder's output gets a residual correction from
+RGB and depth are encoded and summed, the result is fused with the memory bank
+by memory attention, and the decoder's output gets a residual correction from
 full-resolution RGB before being written back into the bank. Starred blocks are
 what SAM-VTP adds on top of SAM 2.
 
@@ -166,18 +163,21 @@ decoder are accepted and ignored. A checkpoint carrying SAM 2's
 `point_embeddings` / `mask_downscaling` weights is a different model and won't
 load.
 
-**Memory is ego-motion compensated.** SAM 2 tags each memory slot with a position
-encoding that is a pure function of grid index, giving memory attention the prior
-"token *k* in memory is token *k* now". For a near-static camera tracking an
-object that is close enough to true; on a forward-driving robot it is false every
-frame, since the field flows outward and rescales. Supplying the correspondence
-from depth and pose means the network doesn't have to recover it from appearance.
-Cells with no counterpart in a past frame get a learned `no_corr_embed` rather
-than zeros. Occlusion is left to the network.
+**Memory is read without geometric alignment.** SAM 2 tags each memory slot with
+a position encoding that is a pure function of grid index, giving memory
+attention the prior "token *k* in memory is token *k* now". On a forward-driving
+robot that is false every frame, since the field flows outward and rescales. An
+earlier revision resampled stored features into the current camera frame using
+depth and pose to supply the correspondence explicitly. It was removed: measured
+at 1000 sequence windows it moved fuzzy Jaccard by +0.0016 (95% CI
+[-0.0035, +0.0002], not significant, and smaller than twice the seed-to-seed
+spread) while requiring a camera pose at inference. Attention recovers the
+correspondence from content well enough that paying a localisation dependency for
+it is not worth it.
 
 Checkpoints load **strictly**, and the architecture is read back from the weights
-rather than from flags — the geometry encoder, warp embedding and refinement head
-are top-level modules, so a lenient load would drop all of their tensors silently
+rather than from flags — the geometry encoder and refinement head are top-level
+modules, so a lenient load would drop all of their tensors silently
 and run an ablated model under the full model's name.
 
 ## Label generation
@@ -199,9 +199,9 @@ four choices that shape the output most.
 
 ```
 src/sam_vtp_core/
-  architecture.py   the entire network: SAM 2 blocks, geometry, warp, SAM-VTP
+  architecture.py   the entire network: SAM 2 blocks, geometry, SAM-VTP
   factory.py        checkpoint-driven construction (strict)
-  inference.py      sequence inference, depth/pose loading
+  inference.py      sequence inference, depth loading
   stream.py         camera-agnostic streaming loop
   fullgraph.py      optional CUDA-graph replay of the full forward pass
   cli.py, smoke.py  entry points

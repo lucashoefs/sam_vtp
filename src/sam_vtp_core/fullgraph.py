@@ -10,14 +10,13 @@ the forward pass once and replaying it removes that overhead.
 The obstacle is that the model is recurrent through a Python dict, which a graph
 cannot walk. So this runner mirrors the memory read path over *fixed tensors*:
 the bank becomes a stacked tensor, eviction becomes a shift-and-copy, the frame
-counter becomes a device scalar, and the stored per-frame poses become another
+counter becomes a device scalar, and the stored per-frame features become another
 stacked tensor. Once the bank is full the control flow is constant and the whole
-pass is capturable, geometry and ego-motion warp included.
+pass is capturable, geometry included.
 
 Everything the geometry path does is fixed-shape given a fixed input size: the
 derived channels are interpolate, median, meshgrid, cross product and two box
-convolutions, and the warp is a single `grid_sample` over a constant 7-fold
-batch. The current frame's depth and pose are static input buffers, exactly like
+convolutions. The current frame's depth is a static input buffer, exactly like
 the image.
 
 Write cadence
@@ -54,10 +53,8 @@ import torch.nn.functional as F
 
 from .architecture import (
     SAMVTP,
-    downsample_depth,
     geometry_channels,
     get_1d_sine_pe,
-    warp_features,
 )
 
 
@@ -68,11 +65,9 @@ class _TensorState:
     cond_maskmem_features: torch.Tensor      # (B, mem_dim, Hm, Wm)
     cond_maskmem_pos_enc: torch.Tensor       # (B, mem_dim, Hm, Wm)
     cond_obj_ptr: torch.Tensor               # (B, C)
-    cond_pose: torch.Tensor                  # (B, 7)
     non_cond_maskmem_features: torch.Tensor  # (k, B, mem_dim, Hm, Wm)
     non_cond_maskmem_pos_enc: torch.Tensor   # (k, B, mem_dim, Hm, Wm)
     non_cond_obj_ptr: torch.Tensor           # (k, B, C)
-    non_cond_pose: torch.Tensor              # (k, B, 7)
     step_idx: torch.Tensor
 
 
@@ -125,7 +120,6 @@ class SAMVTPFullGraphReplayRunner:
         self._state: Optional[_TensorState] = None
         self._static_input: Optional[torch.Tensor] = None
         self._static_depth: Optional[torch.Tensor] = None
-        self._static_pose: Optional[torch.Tensor] = None
         self._static_valid: Optional[torch.Tensor] = None
         self._static_output: Optional[Dict[str, torch.Tensor]] = None
         self._static_output_nowrite: Optional[Dict[str, torch.Tensor]] = None
@@ -143,8 +137,6 @@ class SAMVTPFullGraphReplayRunner:
             return f"CUDA Graph fell back to eager (capture failed: {self._capture_error})"
         if self._captured:
             extra = []
-            if self.model.warp_memory:
-                extra.append("warp")
             if self.model.use_geometry:
                 extra.append("geometry")
             suffix = f", {' + '.join(extra)} in graph" if extra else ""
@@ -167,87 +159,41 @@ class SAMVTPFullGraphReplayRunner:
     def _sync_tensor_state_from_model(self) -> bool:
         """Copy the model's dict-based memory into fixed tensors.
 
-        Returns False until the bank is full, and (when the model warps) until
-        every slot carries the pose it was observed from.
+        Returns False until the bank is full.
         """
         cond = self.model.output_dict.get("cond_frame_outputs", {})
         non_cond = self.model.output_dict.get("non_cond_frame_outputs", {})
         if (0 not in cond) or (self._k > 0 and len(non_cond) < self._k):
             return False
 
-        needs_pose = bool(self.model.warp_memory)
         c = cond[0]
-        if needs_pose and c.get("pose") is None:
-            return False
-
         cond_feats = c["maskmem_features"].to(self.device)
         cond_pos = c["maskmem_pos_enc"][-1].to(self.device)
         cond_ptr = c["obj_ptr"].to(self.device)
-        cond_pose = (c["pose"].to(self.device) if needs_pose
-                     else cond_ptr.new_zeros(cond_ptr.shape[0], 7))
 
         if self._k > 0:
             items = sorted(non_cond.items(), key=lambda kv: kv[0])[-self._k :]
-            if needs_pose and any(it[1].get("pose") is None for it in items):
-                return False
             nc_feats = torch.stack([it[1]["maskmem_features"].to(self.device) for it in items], 0)
             nc_pos = torch.stack([it[1]["maskmem_pos_enc"][-1].to(self.device) for it in items], 0)
             nc_ptr = torch.stack([it[1]["obj_ptr"].to(self.device) for it in items], 0)
-            nc_pose = (torch.stack([it[1]["pose"].to(self.device) for it in items], 0)
-                       if needs_pose else nc_ptr.new_zeros(self._k, *cond_pose.shape))
         else:
             nc_feats = cond_feats.new_zeros((0, *cond_feats.shape))
             nc_pos = cond_pos.new_zeros((0, *cond_pos.shape))
             nc_ptr = cond_ptr.new_zeros((0, *cond_ptr.shape))
-            nc_pose = cond_pose.new_zeros((0, *cond_pose.shape))
 
         self._state = _TensorState(
             cond_maskmem_features=cond_feats,
             cond_maskmem_pos_enc=cond_pos,
             cond_obj_ptr=cond_ptr,
-            cond_pose=cond_pose,
             non_cond_maskmem_features=nc_feats,
             non_cond_maskmem_pos_enc=nc_pos,
             non_cond_obj_ptr=nc_ptr,
-            non_cond_pose=nc_pose,
             step_idx=torch.tensor(float(self.model.frame_idx), device=self.device,
                                   dtype=torch.float32),
         )
         return True
 
     # -- forward -------------------------------------------------------------
-    def _warped_bank(self, feat_size) -> torch.Tensor:
-        """Every stored feature map resampled into the current camera frame.
-
-        Returns (1 + k, B, mem_dim, Hm, Wm), conditioning slot first, matching
-        the order `_memory_conditioned_pix_feat` consumes. All slots share the
-        current depth and pose and differ only in their own stored pose, so the
-        whole bank warps in one `grid_sample` over a constant batch.
-        """
-        s = self._state
-        feats = torch.cat([s.cond_maskmem_features.unsqueeze(0),
-                           s.non_cond_maskmem_features], dim=0)      # (S, B, Cm, Hm, Wm)
-        poses = torch.cat([s.cond_pose.unsqueeze(0), s.non_cond_pose], dim=0)  # (S, B, 7)
-        S, B = feats.shape[0], feats.shape[1]
-
-        depth = downsample_depth(self._static_depth, tuple(feat_size))
-        # reshape puts slot s, batch b at index s*B + b, and repeat(S, ...) lays
-        # the current depth and pose out in exactly that order.
-        flat = feats.reshape(S * B, *feats.shape[2:])
-        warped, valid = warp_features(
-            flat.float(),
-            depth.float().repeat(S, 1, 1, 1),
-            self._static_pose.float().repeat(S, 1),
-            poses.reshape(S * B, 7).float(),
-            mode=self.model.warp_mode, cam=self.model.camera,
-            depth_valid=None if self._static_valid is None else
-            downsample_depth(self._static_valid.float(), tuple(feat_size)).repeat(S, 1, 1, 1))
-
-        warped = warped.to(feats.dtype)
-        valid = valid.to(feats.dtype)
-        blended = warped * valid + self.model.no_corr_embed.to(feats.dtype) * (1.0 - valid)
-        return blended.reshape(S, B, *feats.shape[2:])
-
     def _memory_conditioned_pix_feat(self, vision_feats, vision_pos_embeds, feat_sizes):
         assert self._state is not None
         core = self.model.sam2_model
@@ -256,11 +202,7 @@ class SAMVTPFullGraphReplayRunner:
         H, W = feat_sizes[-1]
         s = self._state
 
-        if self.model.warp_memory and self._static_depth is not None:
-            bank = self._warped_bank(feat_sizes[-1])
-            cond_feat, non_cond_feat = bank[0], bank[1:]
-        else:
-            cond_feat, non_cond_feat = s.cond_maskmem_features, s.non_cond_maskmem_features
+        cond_feat, non_cond_feat = s.cond_maskmem_features, s.non_cond_maskmem_features
 
         to_cat = [cond_feat.flatten(2).permute(2, 0, 1)]
         to_cat_pos = [s.cond_maskmem_pos_enc.flatten(2).permute(2, 0, 1)
@@ -363,34 +305,27 @@ class SAMVTPFullGraphReplayRunner:
             s.non_cond_maskmem_features[-1].copy_(maskmem_features)
             s.non_cond_maskmem_pos_enc[-1].copy_(maskmem_pos_enc[-1])
             s.non_cond_obj_ptr[-1].copy_(obj_ptr)
-            if self.model.warp_memory:
-                # The slot stores the pose it was observed from, so a later
-                # frame can warp it into its own view.
-                s.non_cond_pose[:-1].copy_(s.non_cond_pose[1:].clone())
-                s.non_cond_pose[-1].copy_(self._static_pose)
         self._state.step_idx.add_(1.0)
 
         return {"logits": mask_logits}
 
     # -- capture -------------------------------------------------------------
     def _capture(self, frame: torch.Tensor, depth: Optional[torch.Tensor],
-                 pose: Optional[torch.Tensor],
                  depth_valid: Optional[torch.Tensor]) -> None:
         s = self._state
         assert s is not None
         snap = (s.non_cond_maskmem_features.clone(), s.non_cond_maskmem_pos_enc.clone(),
-                s.non_cond_obj_ptr.clone(), s.non_cond_pose.clone(), s.step_idx.clone())
+                s.non_cond_obj_ptr.clone(), s.step_idx.clone())
 
         self._static_input = torch.empty_like(frame)
         self._static_depth = torch.empty_like(depth) if depth is not None else None
-        self._static_pose = torch.empty_like(pose) if pose is not None else None
         self._static_valid = (torch.empty_like(depth_valid, dtype=torch.float32)
                               if depth_valid is not None else None)
 
         capture_stream = torch.cuda.Stream(device=self.device)
         torch.cuda.synchronize(self.device)
         with torch.cuda.stream(capture_stream):
-            self._copy_inputs(frame, depth, pose, depth_valid)
+            self._copy_inputs(frame, depth, depth_valid)
             # Warmup populates the position-encoding and RoPE caches, which would
             # otherwise be built (and stored in Python dicts) mid-capture.
             for _ in range(self.capture_warmup):
@@ -414,17 +349,14 @@ class SAMVTPFullGraphReplayRunner:
         s.non_cond_maskmem_features.copy_(snap[0])
         s.non_cond_maskmem_pos_enc.copy_(snap[1])
         s.non_cond_obj_ptr.copy_(snap[2])
-        s.non_cond_pose.copy_(snap[3])
-        s.step_idx.copy_(snap[4])
+        s.step_idx.copy_(snap[3])
         self._captured = True
         self._captured_component_epoch = self.model.component_epoch
 
-    def _copy_inputs(self, frame, depth, pose, depth_valid) -> None:
+    def _copy_inputs(self, frame, depth, depth_valid) -> None:
         self._static_input.copy_(frame)
         if self._static_depth is not None and depth is not None:
             self._static_depth.copy_(depth)
-        if self._static_pose is not None and pose is not None:
-            self._static_pose.copy_(pose)
         if self._static_valid is not None and depth_valid is not None:
             self._static_valid.copy_(depth_valid.float())
 
@@ -448,7 +380,7 @@ class SAMVTPFullGraphReplayRunner:
         return update_memory
 
     def run(self, frame: torch.Tensor, is_init_frame: bool, update_memory: bool = True,
-            depth: Optional[torch.Tensor] = None, pose: Optional[torch.Tensor] = None,
+            depth: Optional[torch.Tensor] = None,
             depth_valid: Optional[torch.Tensor] = None):
         """Run one frame, replaying the captured graph when possible.
 
@@ -460,9 +392,9 @@ class SAMVTPFullGraphReplayRunner:
         """
         eager = lambda: self.model.forward_frame(  # noqa: E731
             frame, is_init_frame=is_init_frame, update_memory=update_memory,
-            depth=depth, pose=pose, depth_valid=depth_valid)
+            depth=depth, depth_valid=depth_valid)
 
-        # A captured graph has warp/geometry/refine/memory baked into its control
+        # A captured graph has geometry/refine/memory baked into its control
         # flow, so a switch flipped afterwards would be ignored and the graph
         # would keep replaying the configuration it was captured with -- silently
         # reporting ablation numbers that are really the full model's, or the
@@ -485,7 +417,7 @@ class SAMVTPFullGraphReplayRunner:
 
         if not self._captured:
             try:
-                self._capture(frame, depth, pose, depth_valid)
+                self._capture(frame, depth, depth_valid)
             except Exception as exc:
                 self._capture_failed = True
                 self._capture_error = f"{type(exc).__name__}: {exc}"
@@ -502,7 +434,7 @@ class SAMVTPFullGraphReplayRunner:
                 "graph was captured. Build the runner with capture_nowrite=True "
                 "(SAMVTPStreamProcessor does this when a write cadence is set).")
 
-        self._copy_inputs(frame, depth, pose, depth_valid)
+        self._copy_inputs(frame, depth, depth_valid)
         if writes:
             self._graph.replay()
             return self._static_output

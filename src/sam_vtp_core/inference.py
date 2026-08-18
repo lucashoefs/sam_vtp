@@ -102,7 +102,7 @@ def read_depth_metres(path: Path, scale: float = 1.0, packed_bgra: bool = True) 
     Two traps, both of which produce a plausible-looking wrong answer rather
     than an error:
 
-    `scale`. The geometry channels and the ego-motion warp are metric, so depth
+    `scale`. The geometry channels are metric, so depth
     in millimetres yields slopes, heights and correspondences wrong by a
     thousandfold while the network still emits a believable mask.
 
@@ -154,20 +154,6 @@ def load_depth_tensor(path: Path, scale: float = 1.0,
     return d
 
 
-def load_poses(path: str) -> torch.Tensor:
-    """Load camera-to-world poses, one row of `[x y z qx qy qz qw]` per frame.
-
-    The quaternion is scalar-LAST and the world frame is NED, matching
-    TartanGround's `pose_lcam_front.txt`. A scalar-first file loads without
-    complaint and rotates everything wrongly, so check your source.
-    """
-    arr = np.loadtxt(Path(path).expanduser(), dtype=np.float32)
-    arr = arr.reshape(1, -1) if arr.ndim == 1 else arr
-    if arr.shape[1] != 7:
-        raise ValueError(f"expected 7 columns [x y z qx qy qz qw], got {arr.shape[1]}")
-    return torch.from_numpy(arr)
-
-
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
@@ -191,7 +177,6 @@ def infer_sequence(
     resize_hw: Optional[Tuple[int, int]] = None,
     threshold: float = 0.5,
     depth_paths: Optional[Sequence[Path]] = None,
-    poses: Optional[torch.Tensor] = None,
     depth_scale: float = 1.0,
     use_fullgraph: bool = False,
     fullgraph_min_history: int = 16,
@@ -204,9 +189,8 @@ def infer_sequence(
     frames, so a shuffled folder produces a temporally incoherent result rather
     than an error.
 
-    `depth_paths` and `poses` are required for checkpoints trained with the
-    geometry path (all released ones). They must be aligned index-for-index
-    with `image_paths`.
+    `depth_paths` is required for checkpoints trained with the geometry path
+    (all released ones), aligned index-for-index with `image_paths`.
     """
     if not image_paths:
         raise ValueError("image_paths must not be empty")
@@ -214,20 +198,11 @@ def infer_sequence(
     needs_geom = model.needs_depth
     if needs_geom and depth_paths is None:
         raise ValueError(
-            "this checkpoint uses depth (warp_memory/use_geometry). Pass "
-            "depth_paths, or disable both on the model to run the RGB-only "
-            "ablation deliberately.")
-    # Pose is the warp's requirement alone: a geometry-only checkpoint reads
-    # depth and intrinsics and never asks where the camera was, so demanding a
-    # trajectory from it would impose a localisation dependency it does not have.
-    if model.needs_pose and poses is None:
-        raise ValueError(
-            "this checkpoint uses warp_memory, so it needs a pose per frame. "
-            "Pass poses, or disable the warp on the model deliberately.")
+            "this checkpoint uses depth (use_geometry). Pass depth_paths, or "
+            "disable geometry on the model to run the RGB-only ablation "
+            "deliberately.")
     if depth_paths is not None and len(depth_paths) != len(image_paths):
         raise ValueError(f"{len(depth_paths)} depth maps for {len(image_paths)} images")
-    if poses is not None and len(poses) < len(image_paths):
-        raise ValueError(f"{len(poses)} poses for {len(image_paths)} images")
 
     device = next(model.parameters()).device
     runner = SAMVTPFullGraphReplayRunner(
@@ -250,12 +225,10 @@ def infer_sequence(
                 device=device, dtype=torch.float32, non_blocking=True)
             out_h, out_w = int(frame.shape[-2]), int(frame.shape[-1])
 
-            depth = pose = None
+            depth = None
             if depth_paths is not None:
                 depth = load_depth_tensor(depth_paths[idx], scale=depth_scale,
                                           resize_hw=(out_h, out_w)).to(device, torch.float32)
-            if poses is not None:
-                pose = poses[idx : idx + 1].to(device, torch.float32)
 
             proc_h, proc_w = compatible_input_hw(model, out_h, out_w)
             if (proc_h, proc_w) != (out_h, out_w):
@@ -269,10 +242,10 @@ def infer_sequence(
                            if use_cuda_amp else nullcontext())
             with amp_context:
                 if use_fullgraph:
-                    out = runner.run(frame, is_init_frame=(idx == 0), depth=depth, pose=pose)
+                    out = runner.run(frame, is_init_frame=(idx == 0), depth=depth)
                 else:
                     out = model.forward_frame(frame, is_init_frame=(idx == 0),
-                                              depth=depth, pose=pose)
+                                              depth=depth)
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             timings.append(time.perf_counter() - t0)

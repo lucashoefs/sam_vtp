@@ -32,7 +32,7 @@ Layout
   6. Memory encoder                   write path
   7. Prompt + mask decoder
   8. SAM 2 core                       the glue holding 4-7 together
-  9. Geometry                         camera model, ego-motion warp, depth channels
+  9. Geometry                         camera model, depth-derived channels
  10. SAM-VTP                          the model itself
 """
 
@@ -55,7 +55,6 @@ __all__ = [
     "CameraIntrinsics",
     "TARTANGROUND",
     "geometry_channels",
-    "warp_features",
 ]
 
 
@@ -111,10 +110,8 @@ class SAMVTPConfig:
     multimask: bool = False
     use_refine_head: bool = True
     refine_head_channels: int = 8
-    warp_memory: bool = True
     use_geometry: bool = True
     geometry_hw: int = 256
-    warp_mode: str = "bilinear"
 
     @property
     def prompt_grid(self) -> int:
@@ -182,7 +179,7 @@ class PositionEmbeddingSine(nn.Module):
     """Standard 2D sine/cosine position encoding, cached per grid size.
 
     Note what this is *not*: it is a pure function of grid index, with no
-    dependence on content. That is the property the ego-motion warp in section 9
+    dependence on content. That is the property the geometry pathway in section 9
     exists to compensate for -- memory tokens carry "I am cell (i, j)", which
     means a different piece of world on every frame of a moving camera.
     """
@@ -1134,13 +1131,13 @@ class SAM2Core(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 9. Geometry: camera model, ego-motion warp, depth-derived channels
+# 9. Geometry: camera model, depth-derived channels
 # ---------------------------------------------------------------------------
 class CameraIntrinsics:
     """A pinhole camera at the resolution its parameters were measured at.
 
     Every physical quantity downstream -- metres of height, degrees of slope, the
-    warp's pixel correspondences -- is recovered by unprojecting through these
+    depth-derived channels -- is recovered by unprojecting through these
     numbers. Supply the wrong ones and the output is not noisier, it is wrong by
     an amount that scales with how far the assumed field of view sits from the
     real one, while still looking entirely plausible. Read the factory
@@ -1189,7 +1186,7 @@ class CameraIntrinsics:
         """Intrinsics rescaled to an (h, w) grid, pixel-centre convention.
 
         Uses `align_corners=False` semantics, under which a resize by factor s
-        maps u -> s*(u + 0.5) - 0.5. Getting this wrong shifts the whole warp by
+        maps u -> s*(u + 0.5) - 0.5. Getting this wrong shifts the geometry by
         up to half a cell, which at feature resolution is eight native pixels.
         """
         sx, sy = w / self.width, h / self.height
@@ -1202,195 +1199,6 @@ NATIVE_HW = 640
 NATIVE_FY = NATIVE_HW / 2.0
 TARTANGROUND = CameraIntrinsics(NATIVE_HW / 2.0, NATIVE_HW / 2.0,
                                 NATIVE_HW / 2.0, NATIVE_HW / 2.0, NATIVE_HW, NATIVE_HW)
-
-# Optical (x right, y down, z forward) -> NED body (x forward, y right, z down).
-#
-# Set this to the identity if you feed the camera optical frame's own pose
-# instead of the platform body pose, which is the simplest thing to do from a
-# ROS TF tree. Only the relative transform between two frames is ever used, and
-# that is invariant to the world frame the poses are expressed in, so the body
-# convention is the only axis choice that matters.
-_R_OPT2NED = torch.tensor([[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
-
-_R_OPT2NED_CACHE: Dict[Any, torch.Tensor] = {}
-
-
-def _opt2ned(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    """`_R_OPT2NED` on the requested device, cached.
-
-    Copying it per call would be a host-to-device transfer from pageable memory,
-    which is a synchronising operation and cannot be captured in a CUDA graph.
-    The cache is filled on the first call, so warm up before capturing.
-    """
-    key = (str(device), dtype)
-    m = _R_OPT2NED_CACHE.get(key)
-    if m is None:
-        m = _R_OPT2NED.to(device=device, dtype=dtype)
-        _R_OPT2NED_CACHE[key] = m
-    return m
-
-
-def quat_to_rotmat(q: torch.Tensor) -> torch.Tensor:
-    """`[qx, qy, qz, qw]` (scalar last) to rotation matrices."""
-    q = q / q.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-    x, y, z, w = q.unbind(-1)
-    xx, yy, zz = x * x, y * y, z * z
-    xy, xz, yz = x * y, x * z, y * z
-    wx, wy, wz = w * x, w * y, w * z
-    return torch.stack([
-        1 - 2 * (yy + zz), 2 * (xy - wz), 2 * (xz + wy),
-        2 * (xy + wz), 1 - 2 * (xx + zz), 2 * (yz - wx),
-        2 * (xz - wy), 2 * (yz + wx), 1 - 2 * (xx + yy),
-    ], dim=-1).reshape(*q.shape[:-1], 3, 3)
-
-
-def quat_mul(a, b) -> torch.Tensor:
-    """Hamilton product of two scalar-last quaternions."""
-    a = torch.as_tensor(a, dtype=torch.float32).reshape(-1, 4)
-    b = torch.as_tensor(b, dtype=torch.float32).reshape(-1, 4)
-    ax, ay, az, aw = a.unbind(-1)
-    bx, by, bz, bw = b.unbind(-1)
-    return torch.stack([aw * bx + ax * bw + ay * bz - az * by,
-                        aw * by - ax * bz + ay * bw + az * bx,
-                        aw * bz + ax * by - ay * bx + az * bw,
-                        aw * bw - ax * bx - ay * by - az * bz], dim=-1)
-
-
-# Right-multiplier taking a world-to-camera-OPTICAL rotation to the world-to-
-# NED-body rotation the model expects. Optical axes are x right, y down,
-# z forward; NED body is x forward, y right, z down.
-Q_OPTICAL_TO_NED_BODY = (-0.5, -0.5, -0.5, 0.5)
-
-# Same, from a ROS REP-103 body frame (x forward, y left, z up), which differs
-# from NED body by 180 degrees about x.
-Q_FLU_TO_NED_BODY = (1.0, 0.0, 0.0, 0.0)
-
-
-def pose_from_optical(translation, quaternion_xyzw) -> torch.Tensor:
-    """Model pose from the pose of the camera's OPTICAL frame.
-
-    This is the easy path from a ROS TF tree: look up `odom` to
-    `<camera>_color_optical_frame` at the image timestamp and pass its
-    translation and rotation straight in.
-
-    The world frame does not have to be NED. Only the relative transform
-    between two frames is ever used, and that is invariant to the world frame,
-    so any fixed right-handed frame works as long as every pose in a sequence
-    uses the same one. What must be right is the camera axis convention, which
-    is what this function fixes.
-
-    `translation` must be the position of the same frame whose rotation you
-    give. Using the base-link position with the camera's rotation introduces a
-    lever-arm error that does not cancel when the robot turns.
-
-    Args:
-        translation: (3,) or (B, 3) position of the optical frame in the world.
-        quaternion_xyzw: (4,) or (B, 4) world-from-optical rotation, scalar-last.
-
-    Returns:
-        (B, 7) `[x y z qx qy qz qw]` ready for `forward_frame(pose=...)`.
-    """
-    t = torch.as_tensor(translation, dtype=torch.float32).reshape(-1, 3)
-    q = quat_mul(quaternion_xyzw, Q_OPTICAL_TO_NED_BODY)
-    return torch.cat([t, q.reshape(-1, 4)], dim=-1)
-
-
-def pose_from_flu(translation, quaternion_xyzw) -> torch.Tensor:
-    """Model pose from a ROS REP-103 body frame (x forward, y left, z up).
-
-    See `pose_from_optical` for the world-frame and lever-arm caveats; the
-    latter bites harder here, since an FLU frame is usually the robot base
-    rather than the camera. Prefer `pose_from_optical` when TF can give you the
-    optical frame directly.
-    """
-    t = torch.as_tensor(translation, dtype=torch.float32).reshape(-1, 3)
-    q = quat_mul(quaternion_xyzw, Q_FLU_TO_NED_BODY)
-    return torch.cat([t, q.reshape(-1, 4)], dim=-1)
-
-
-def relative_optical_transform(pose_cur: torch.Tensor, pose_mem: torch.Tensor):
-    """Rigid transform taking current-frame optical coordinates into a past frame.
-
-    Poses are camera-to-world `[x y z qx qy qz qw]` in a NED world frame.
-    Returns (A, b) with `X_mem = A @ X_cur + b` in optical coordinates.
-    """
-    P = _opt2ned(pose_cur.device, pose_cur.dtype)
-    Pt = P.transpose(-1, -2)
-    R_cur = quat_to_rotmat(pose_cur[..., 3:])
-    R_mem = quat_to_rotmat(pose_mem[..., 3:])
-    R_mem_inv = R_mem.transpose(-1, -2)
-    A = Pt @ R_mem_inv @ R_cur @ P
-    b = (Pt @ R_mem_inv @ (pose_cur[..., :3] - pose_mem[..., :3]).unsqueeze(-1)).squeeze(-1)
-    return A, b
-
-
-def build_warp_grid(depth_cur: torch.Tensor, pose_cur: torch.Tensor, pose_mem: torch.Tensor,
-                    min_depth: float = 0.1, max_depth: float = 200.0,
-                    cam: CameraIntrinsics = TARTANGROUND,
-                    depth_valid: Optional[torch.Tensor] = None):
-    """Grid mapping each current-frame cell to where that 3D point was seen before.
-
-    Backward warping: the grid is built by unprojecting the *current* frame and
-    projecting into the past, so every destination cell gets exactly one source
-    location and the result is dense. It also means only the current frame's
-    depth is needed -- which is the only depth a robot has at deployment.
-
-    Occlusion is not resolved: a point visible now may have been hidden then, and
-    the sample then returns whatever occluded it. Out-of-frustum and behind-camera
-    samples are flagged exactly in `valid`; genuine occlusion is left to the
-    network, which is what the validity gate and `no_corr_embed` exist for.
-    """
-    B, _, H, W = depth_cur.shape
-    device, dtype = depth_cur.device, depth_cur.dtype
-    fx, fy, cx, cy = cam.scaled(H, W)
-
-    vs, us = torch.meshgrid(
-        torch.arange(H, device=device, dtype=dtype),
-        torch.arange(W, device=device, dtype=dtype),
-        indexing="ij")
-
-    z = depth_cur[:, 0].clamp(min_depth, max_depth)
-    finite = torch.isfinite(depth_cur[:, 0]) & (depth_cur[:, 0] > min_depth)
-    if depth_valid is not None:
-        finite = finite & depth_valid.reshape(B, H, W).bool()
-    x = (us - cx) * z / fx
-    y = (vs - cy) * z / fy
-    pts = torch.stack([x, y, z], dim=-1).reshape(B, -1, 3)
-
-    A, b = relative_optical_transform(pose_cur, pose_mem)
-    pts_mem = pts @ A.transpose(-1, -2) + b.unsqueeze(1)
-
-    zm = pts_mem[..., 2]
-    in_front = zm > min_depth
-    zm_safe = torch.where(in_front, zm, torch.ones_like(zm))
-    um = pts_mem[..., 0] * fx / zm_safe + cx
-    vm = pts_mem[..., 1] * fy / zm_safe + cy
-
-    gx = 2.0 * (um + 0.5) / W - 1.0
-    gy = 2.0 * (vm + 0.5) / H - 1.0
-    grid = torch.stack([gx, gy], dim=-1).reshape(B, H, W, 2)
-
-    valid = (in_front.reshape(B, 1, H, W)
-             & finite.reshape(B, 1, H, W)
-             & (gx.abs() <= 1.0).reshape(B, 1, H, W)
-             & (gy.abs() <= 1.0).reshape(B, 1, H, W)).to(dtype)
-
-    # grid_sample tolerates out-of-range coordinates under zero padding, but
-    # non-finite ones poison the output, so pin them somewhere harmless.
-    return torch.nan_to_num(grid, nan=-2.0, posinf=-2.0, neginf=-2.0), valid
-
-
-def warp_features(feat_mem: torch.Tensor, depth_cur: torch.Tensor,
-                  pose_cur: torch.Tensor, pose_mem: torch.Tensor,
-                  mode: str = "bilinear", cam: CameraIntrinsics = TARTANGROUND,
-                  depth_valid: Optional[torch.Tensor] = None):
-    """Resample a past frame's features onto the current frame's grid."""
-    grid, valid = build_warp_grid(depth_cur, pose_cur, pose_mem, cam=cam,
-                                  depth_valid=depth_valid)
-    warped = F.grid_sample(feat_mem, grid.to(feat_mem.dtype), mode=mode,
-                           padding_mode="zeros", align_corners=False)
-    return warped, valid.to(warped.dtype)
-
 
 def downsample_depth(depth: torch.Tensor, size: Tuple[int, int]) -> torch.Tensor:
     """Reduce depth to feature resolution with nearest sampling, deliberately.
@@ -1662,15 +1470,36 @@ class RefinementHead(nn.Module):
         return coarse_logits + self.out(self.stem(x))
 
 
+def warp_state(state: Dict[str, torch.Tensor]) -> str:
+    """Classify a checkpoint's relationship to the removed ego-motion warp.
+
+    Returns "absent", "inert", or "trained".
+
+    Presence of `no_corr_embed` alone does NOT mean a checkpoint used the warp.
+    The trainer allocated that parameter unconditionally, so every no-warp
+    checkpoint carries it too -- at exactly its zero initialisation, because
+    nothing ever read it. Rejecting on the key would therefore refuse the very
+    checkpoints this build is for. The trained ones are distinguishable: theirs
+    has moved off zero (0.048 absmax on the seed-42 warp run, 0.0 on both
+    geometry-only runs).
+
+    An inert embed is safe to drop: with `warp_memory=False` the aligned-memory
+    path was never entered, so the weights are numerically identical to a model
+    that never had the parameter.
+    """
+    t = state.get("no_corr_embed")
+    if t is None:
+        return "absent"
+    return "trained" if float(t.abs().max()) > 0.0 else "inert"
+
+
 class SAMVTP(nn.Module):
     """Video traversability prediction with a geometry-aligned temporal memory.
 
     Per frame:
       1. the image encoder produces multi-scale features;
       2. optionally, depth-derived geometry is added to the coarsest level;
-      3. memory attention conditions those features on the memory bank, whose
-         entries are first resampled into the current camera frame using depth
-         and relative pose;
+      3. memory attention conditions those features on the memory bank;
       4. the mask decoder emits traversability logits under a fixed learned prompt;
       5. a residual head recovers sub-stride detail from full-resolution RGB;
       6. the memory encoder writes the frame back into the bank.
@@ -1690,10 +1519,8 @@ class SAMVTP(nn.Module):
 
         self.num_maskmem = cfg.num_maskmem
         self.multimask_output = cfg.multimask
-        self.warp_memory = cfg.warp_memory
         self.use_geometry = cfg.use_geometry
         self.geometry_hw = cfg.geometry_hw
-        self.warp_mode = cfg.warp_mode
         self.camera = TARTANGROUND
         self.input_normalization_mode = "0_255"
         self._max_non_cond_frames = max(0, cfg.num_maskmem - 1)
@@ -1715,7 +1542,6 @@ class SAMVTP(nn.Module):
         self.use_refine_head = cfg.use_refine_head
         self._trained_components: Dict[str, bool] = {
             "memory": True,                    # any SAM-VTP checkpoint has memory
-            "warp": bool(cfg.warp_memory),
             "geometry": bool(cfg.use_geometry),
             "refine": bool(cfg.use_refine_head),
         }
@@ -1732,11 +1558,6 @@ class SAMVTP(nn.Module):
         self.sam2_model = SAM2Core(cfg)
 
         self.refine_head = RefinementHead(cfg.refine_head_channels) if cfg.use_refine_head else None
-
-        # Learned stand-in for "this cell has no counterpart in that frame".
-        # Zero-init, so the model starts from plain zero-padding behaviour.
-        self.no_corr_embed = (nn.Parameter(torch.zeros(1, cfg.mem_dim, 1, 1))
-                              if cfg.warp_memory else None)
 
         self.geometry_encoder = None
         if cfg.use_geometry:
@@ -1759,24 +1580,20 @@ class SAMVTP(nn.Module):
     def needs_depth(self) -> bool:
         """True when depth is required for the model to behave as trained.
 
-        Both consumers need it: the geometry channels derive from it, and the
-        warp reprojects through it. The warp only acts when memory is read, so
-        with memory switched off it stops being a reason to demand anything.
+        Only the geometry channels consume it, and they are a function of depth
+        and intrinsics alone -- log depth, slope, roughness, height, validity.
         """
-        return bool(self.use_geometry or (self.warp_memory and self.use_memory))
+        return bool(self.use_geometry)
 
     @property
     def needs_pose(self) -> bool:
-        """True when pose is required. ONLY the warp needs it.
+        """Always False. Retained so existing callers keep working.
 
-        Kept separate from `needs_depth` because conflating them makes a
-        geometry-only model demand a camera pose it never reads, and so makes it
-        depend on localisation it does not actually use. The geometry channels
-        are a function of depth and intrinsics alone -- log depth, slope,
-        roughness, height, validity -- and none of them asks where the camera
-        was.
+        Nothing in this model reads a camera pose. The ego-motion warp that once
+        did was removed; it cost a localisation dependency and did not measurably
+        improve accuracy. Callers may stop looking up transforms entirely.
         """
-        return bool(self.warp_memory and self.use_memory)
+        return False
 
     @property
     def needs_geometry(self) -> bool:
@@ -1788,12 +1605,10 @@ class SAMVTP(nn.Module):
 
     # -- component switches --------------------------------------------------
     #
-    # Four independent parts can be turned off at runtime:
+    # Three independent parts can be turned off at runtime:
     #
     #   memory    temporal memory bank. Off = frame-wise: every frame is
     #             predicted from scratch, nothing is written or read.
-    #   warp      ego-motion alignment of stored memory before it is read.
-    #             Requires memory; a no-op without it.
     #   geometry  the depth-derived feature added to the coarsest backbone level.
     #   refine    the residual refinement head on the upsampled logits.
     #
@@ -1805,7 +1620,7 @@ class SAMVTP(nn.Module):
     # the same model as one TRAINED without the component, and the two should
     # never be reported as if they were. `component_deviations` exists so a log
     # line can tell them apart, and `describe()` prints it.
-    COMPONENTS: Tuple[str, ...] = ("memory", "warp", "geometry", "refine")
+    COMPONENTS: Tuple[str, ...] = ("memory", "geometry", "refine")
 
     @property
     def component_epoch(self) -> int:
@@ -1817,7 +1632,6 @@ class SAMVTP(nn.Module):
         """Which components are in use right now."""
         return {
             "memory": bool(self.use_memory),
-            "warp": bool(self.warp_memory),
             "geometry": bool(self.use_geometry),
             "refine": bool(self.use_refine_head and self.refine_head is not None),
         }
@@ -1842,7 +1656,6 @@ class SAMVTP(nn.Module):
         self,
         *,
         memory: Optional[bool] = None,
-        warp: Optional[bool] = None,
         geometry: Optional[bool] = None,
         refine: Optional[bool] = None,
     ) -> "SAMVTP":
@@ -1855,17 +1668,16 @@ class SAMVTP(nn.Module):
 
         Call before the first frame. Changing switches mid-sequence leaves a
         memory bank written under the old configuration, so this resets memory
-        whenever `memory` or `warp` changes.
+        whenever `memory` changes.
 
         Returns self, so it chains: `build_model(...).set_components(memory=False)`.
         """
-        requested = {"memory": memory, "warp": warp, "geometry": geometry, "refine": refine}
+        requested = {"memory": memory, "geometry": geometry, "refine": refine}
         requested = {k: v for k, v in requested.items() if v is not None}
         if not requested:
             return self
 
         missing = {
-            "warp": self.no_corr_embed is None,
             "geometry": self.geometry_encoder is None,
             "refine": self.refine_head is None,
         }
@@ -1880,8 +1692,6 @@ class SAMVTP(nn.Module):
         before = self.active_components
         if "memory" in requested:
             self.use_memory = bool(requested["memory"])
-        if "warp" in requested:
-            self.warp_memory = bool(requested["warp"])
         if "geometry" in requested:
             self.use_geometry = bool(requested["geometry"])
         if "refine" in requested:
@@ -1889,7 +1699,7 @@ class SAMVTP(nn.Module):
 
         if self.active_components != before:
             self._component_epoch += 1
-        if before["memory"] != self.use_memory or before["warp"] != self.warp_memory:
+        if before["memory"] != self.use_memory:
             self.reset_memory()
         return self
 
@@ -1936,17 +1746,14 @@ class SAMVTP(nn.Module):
         device = next(self.parameters()).device
         dtype = next(self.parameters()).dtype
         image = torch.zeros(1, 3, int(hw[0]), int(hw[1]), device=device, dtype=dtype)
-        depth = pose = None
+        depth = None
         if self.needs_depth:
             depth = torch.full((1, 1, int(hw[0]), int(hw[1])), 5.0,
                                device=device, dtype=dtype)
-        if self.needs_pose:
-            pose = torch.zeros(1, 7, device=device, dtype=dtype)
-            pose[0, 6] = 1.0
         was_training = self.training
         self.eval()
         for i in range(max(1, int(n))):
-            self.forward_frame(image, is_init_frame=(i == 0), depth=depth, pose=pose)
+            self.forward_frame(image, is_init_frame=(i == 0), depth=depth)
         self.reset_memory()
         if was_training:
             self.train()
@@ -1967,69 +1774,6 @@ class SAMVTP(nn.Module):
         else:
             raise ValueError(f"unknown input_normalization_mode {mode!r}")
         return (image.clamp(0.0, 1.0) - self.pixel_mean) / self.pixel_std
-
-    # -- geometry-aware memory read -----------------------------------------
-    def _warped_output_dict(self, depth_feat: torch.Tensor, pose: torch.Tensor,
-                            feat_size: Tuple[int, int],
-                            depth_valid: Optional[torch.Tensor] = None) -> Dict[str, Any]:
-        """A shadow of the memory store with features aligned to the current pose.
-
-        Entries whose pose was never recorded pass through unwarped rather than
-        being dropped: a stale-but-present memory degrades to the unaligned
-        behaviour, whereas dropping it would silently shorten the temporal
-        horizon.
-        """
-        depth = depth_feat
-        if depth.shape[-2:] != tuple(feat_size):
-            depth = downsample_depth(depth, tuple(feat_size))
-        dv = depth_valid
-        if dv is not None and dv.shape[-2:] != tuple(feat_size):
-            dv = downsample_depth(dv.float(), tuple(feat_size))
-
-        # All entries share the current depth and pose and differ only in their
-        # own pose, so N separate grid_sample launches do identical work to one
-        # launch over an N-fold batch. This model is launch-bound, so the
-        # difference is real time.
-        todo = []
-        for bucket in ("cond_frame_outputs", "non_cond_frame_outputs"):
-            for idx, entry in self.output_dict.get(bucket, {}).items():
-                if entry.get("pose") is not None and entry.get("maskmem_features") is not None:
-                    todo.append((bucket, idx, entry))
-
-        rebuilt: Dict[Tuple[str, int], Dict[str, Any]] = {}
-        if todo:
-            feats = torch.cat([e["maskmem_features"].float() for _, _, e in todo], dim=0)
-            poses_mem = torch.cat([e["pose"].float() for _, _, e in todo], dim=0)
-            n = len(todo)
-            with torch.no_grad():
-                # The grid depends only on measured depth and pose, neither of
-                # which is learned, so gradients through it would be gradients
-                # into the sensor readings.
-                warped_all, valid_all = warp_features(
-                    feats, depth.float().repeat(n, 1, 1, 1),
-                    pose.float().repeat(n, 1), poses_mem,
-                    mode=self.warp_mode, cam=self.camera,
-                    depth_valid=None if dv is None else dv.repeat(n, 1, 1, 1))
-
-            cursor = 0
-            for bucket, idx, entry in todo:
-                feat = entry["maskmem_features"]
-                b = feat.shape[0]
-                w = warped_all[cursor : cursor + b].to(feat.dtype)
-                v = valid_all[cursor : cursor + b].to(feat.dtype)
-                cursor += b
-                new_entry = dict(entry)
-                new_entry["maskmem_features"] = w * v + self.no_corr_embed.to(feat.dtype) * (1.0 - v)
-                rebuilt[(bucket, idx)] = new_entry
-
-        shadow: Dict[str, Any] = {}
-        for bucket in ("cond_frame_outputs", "non_cond_frame_outputs"):
-            src = self.output_dict.get(bucket, {})
-            dst = OrderedDict()
-            for idx, entry in src.items():
-                dst[idx] = rebuilt.get((bucket, idx), entry)
-            shadow[bucket] = dst
-        return shadow
 
     # -- prompt --------------------------------------------------------------
     def _prompt_tensors(self, pix_feat: torch.Tensor, B: int):
@@ -2092,7 +1836,6 @@ class SAMVTP(nn.Module):
         is_init_frame: bool = False,
         update_memory: bool = True,
         depth: Optional[torch.Tensor] = None,
-        pose: Optional[torch.Tensor] = None,
         depth_valid: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """Predict one frame and, unless gated, write it into memory.
@@ -2103,32 +1846,22 @@ class SAMVTP(nn.Module):
             is_init_frame: treat this frame as the conditioning frame.
             update_memory: emit a prediction without writing to the bank.
             depth: (B, 1, H, W) metric planar z-depth in metres.
-            pose:  (B, 7) camera-to-world `[x y z qx qy qz qw]`. See
-                `pose_from_optical` for building this from a ROS TF lookup;
-                the world frame is arbitrary, the camera axes are not.
             depth_valid: optional (B, 1, H, W) mask. Non-positive depths are
                 already treated as missing, so this is for evidence a threshold
                 cannot express: the camera's own confidence, a range limit, or
                 a depth map whose holes have been filled with plausible values.
 
         Raises:
-            ValueError: if the model was trained with geometry but depth or pose
-                is missing. Running without them is not a graceful degradation --
-                it silently disables the alignment the weights were fitted with.
+            ValueError: if the model was trained with geometry but depth is
+                missing. Running without it is not a graceful degradation -- it
+                silently disables a pathway the weights were fitted with.
         """
         if self.needs_depth and depth is None:
             raise ValueError(
-                "this checkpoint was trained with warp_memory/use_geometry, so it "
-                "needs depth in METRES per frame. Pass it, or call "
-                "model.set_components(warp=False, geometry=False) to run the "
-                "RGB-only ablation deliberately.")
-        if self.needs_pose and pose is None:
-            raise ValueError(
-                "this checkpoint was trained with warp_memory, so it needs a "
-                "camera pose per frame to align the memory. Pass it, or call "
-                "model.set_components(warp=False) to run without alignment "
-                "deliberately -- note that changes what the weights were fitted "
-                "with.")
+                "this checkpoint was trained with use_geometry, so it needs depth "
+                "in METRES per frame. Pass it, or call "
+                "model.set_components(geometry=False) to run the RGB-only "
+                "ablation deliberately.")
 
         B, _, H, W = image.shape
         image_norm = self.normalize_imagenet(image)
@@ -2162,16 +1895,12 @@ class SAMVTP(nn.Module):
             vision_feats[-1] = vision_feats[-1] + self.sam2_model.no_mem_embed
             pix_feat = vision_feats[-1].permute(1, 2, 0).view(B, -1, *feat_sizes[-1])
         else:
-            output_dict = self.output_dict
-            if self.warp_memory and depth is not None and pose is not None:
-                output_dict = self._warped_output_dict(depth, pose, feat_sizes[-1],
-                                                       depth_valid=depth_valid)
             pix_feat = self.sam2_model.prepare_memory_conditioned_features(
                 frame_idx=self.frame_idx,
                 current_vision_feats=[vision_feats[-1]],
                 current_vision_pos_embeds=[vision_pos_embeds[-1]],
                 feat_sizes=[feat_sizes[-1]],
-                output_dict=output_dict,
+                output_dict=self.output_dict,
             )
 
         sparse_embeddings, dense_embeddings, image_pe = self._prompt_tensors(pix_feat, B)
@@ -2230,11 +1959,6 @@ class SAMVTP(nn.Module):
             "maskmem_pos_enc": maskmem_pos_enc,
             "obj_ptr": obj_ptr,
         }
-        if pose is not None:
-            # Tag the entry with the pose it was observed from, so a later frame
-            # can warp it into its own view.
-            entry["pose"] = pose.detach()
-
         if self.frame_idx == 0:
             self.output_dict["cond_frame_outputs"][self.frame_idx] = entry
         else:
@@ -2249,7 +1973,6 @@ class SAMVTP(nn.Module):
         self,
         image_sequence: torch.Tensor,
         depth_sequence: Optional[torch.Tensor] = None,
-        pose_sequence: Optional[torch.Tensor] = None,
         reset_memory: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """Run a whole clip.
@@ -2257,7 +1980,6 @@ class SAMVTP(nn.Module):
         Args:
             image_sequence: (B, T, 3, H, W) RGB.
             depth_sequence: (B, T, 1, H, W) metric depth in metres.
-            pose_sequence:  (B, T, 7) camera-to-world poses.
         """
         if reset_memory:
             self.reset_memory()
@@ -2267,7 +1989,6 @@ class SAMVTP(nn.Module):
                 image_sequence[:, t],
                 is_init_frame=(t == 0 and reset_memory),
                 depth=None if depth_sequence is None else depth_sequence[:, t],
-                pose=None if pose_sequence is None else pose_sequence[:, t],
             )
             logits.append(out["logits"])
         return {"logits": torch.stack(logits, dim=1)}
@@ -2281,10 +2002,19 @@ class SAMVTP(nn.Module):
         is not a warning but a model that quietly differs from the one whose
         numbers were published.
         """
+        if warp_state(state) == "trained":
+            raise RuntimeError(
+                "this checkpoint was trained with the ego-motion memory warp: it "
+                "carries a NON-ZERO 'no_corr_embed'. This build no longer "
+                "implements the warp -- it did not measurably improve accuracy "
+                "and required a camera pose, i.e. a localisation dependency, at "
+                "inference. Loading it here would silently drop the aligned-memory "
+                "pathway the weights were fitted with and score a model nobody "
+                "trained. Use a checkpoint trained without the warp, or check out "
+                "a revision that still supports it.")
         has = lambda p: any(k.startswith(p) for k in state)  # noqa: E731
         cfg_kwargs: Dict[str, Any] = dict(
             use_refine_head=has("refine_head."),
-            warp_memory="no_corr_embed" in state,
             use_geometry=has("geometry_encoder."),
         )
         if cfg_kwargs["use_refine_head"]:
@@ -2302,11 +2032,20 @@ class SAMVTP(nn.Module):
     def load_checkpoint(self, state: Dict[str, torch.Tensor]) -> None:
         """Load weights strictly, reporting exactly what did not match.
 
-        Not `strict=False`: the geometry encoder, the warp embedding and the
-        refinement head are all top-level modules, so a lenient load drops every
-        one of their tensors without reporting it and runs an ablated model
-        under the full model's name.
+        Not `strict=False`: the geometry encoder and the refinement head are
+        both top-level modules, so a lenient load drops every one of their
+        tensors without reporting it and runs an ablated model under the full
+        model's name.
         """
+        if warp_state(state) == "inert":
+            # Allocated unconditionally by the trainer and never read, so it is
+            # still at zero. Dropping it is exact, not lenient -- but say so,
+            # because a silent key drop is how the geometry encoder went missing
+            # from a whole ablation table once already.
+            state = {k: v for k, v in state.items() if k != "no_corr_embed"}
+            print("[sam-vtp] dropped an unused zero 'no_corr_embed' (the removed "
+                  "ego-motion warp); the remaining weights are unaffected.")
+
         missing, unexpected = self.load_state_dict(state, strict=False)
         # New weights invalidate every constant derived from the old ones.
         self.clear_inference_caches()

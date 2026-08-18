@@ -8,7 +8,7 @@ from pathlib import Path
 import torch
 
 from .factory import build_model, describe
-from .inference import infer_sequence, list_depths, list_images, load_poses
+from .inference import infer_sequence, list_depths, list_images
 
 
 def parse_args() -> argparse.Namespace:
@@ -18,7 +18,7 @@ def parse_args() -> argparse.Namespace:
         epilog=(
             "Frames are consumed in sorted filename order and memory is carried "
             "across them, so the folder must be one sequence in capture order.\n"
-            "Released checkpoints use depth and pose; pass --depth-dir and --poses."
+            "Released checkpoints use depth; pass --depth-dir."
         ))
     p.add_argument("--images-dir", required=True, help="folder of RGB frames, one sequence")
     p.add_argument("--output-dir", required=True, help="where to write probability/ and binary/")
@@ -28,9 +28,6 @@ def parse_args() -> argparse.Namespace:
                    help="folder of depth maps aligned with --images-dir (.npy or .png)")
     p.add_argument("--depth-scale", type=float, default=1.0,
                    help="multiplier converting stored depth to METRES (0.001 for millimetres)")
-    p.add_argument("--poses", default=None,
-                   help="text file, one row [x y z qx qy qz qw] per frame, scalar-last, NED")
-
     p.add_argument("--height", type=int, default=0, help="resize height; 0 keeps native size")
     p.add_argument("--width", type=int, default=0, help="resize width; 0 keeps native size")
     p.add_argument("--threshold", type=float, default=0.5, help="binarisation threshold")
@@ -45,10 +42,8 @@ def parse_args() -> argparse.Namespace:
     # ablation run is never mistaken for a full-model run in a log.
     p.add_argument("--no-memory", dest="memory", action="store_false", default=None,
                    help="frame-wise: predict each frame independently, no temporal memory")
-    p.add_argument("--no-warp", dest="warp", action="store_false", default=None,
-                   help="read memory without ego-motion alignment")
     p.add_argument("--no-geometry", dest="geometry", action="store_false", default=None,
-                   help="RGB-only: drop the depth-derived feature (still needs depth if warping)")
+                   help="RGB-only: drop the depth-derived feature")
     p.add_argument("--no-refine", dest="refine", action="store_false", default=None,
                    help="skip the residual refinement head")
 
@@ -69,7 +64,7 @@ def main() -> int:
         raise RuntimeError("CUDA requested but not available")
     device = torch.device(args.device)
 
-    switches = {k: getattr(args, k) for k in ("memory", "warp", "geometry", "refine")
+    switches = {k: getattr(args, k) for k in ("memory", "geometry", "refine")
                 if getattr(args, k) is not None}
 
     model = build_model(
@@ -82,7 +77,6 @@ def main() -> int:
 
     image_paths = list_images(args.images_dir)
     depth_paths = list_depths(args.depth_dir) if args.depth_dir else None
-    poses = load_poses(args.poses) if args.poses else None
 
     resize_hw = None
     if args.height > 0 and args.width > 0:
@@ -94,7 +88,7 @@ def main() -> int:
     stats = infer_sequence(
         model=model, image_paths=image_paths, output_dir=args.output_dir,
         resize_hw=resize_hw, threshold=float(args.threshold),
-        depth_paths=depth_paths, poses=poses, depth_scale=float(args.depth_scale),
+        depth_paths=depth_paths, depth_scale=float(args.depth_scale),
         use_fullgraph=bool(use_fullgraph),
         fullgraph_min_history=int(args.fullgraph_min_history),
         capture_warmup=int(args.capture_warmup), amp_dtype=args.amp)

@@ -121,7 +121,7 @@ def build_model(
             without this flag falls back to False.
         components: runtime switches, e.g. `{"memory": False}` for the
             frame-wise ablation or `{"geometry": False}` for RGB-only. Keys are
-            `memory`, `warp`, `geometry`, `refine`. These select which of the
+            `memory`, `geometry`, `refine`. These select which of the
             checkpoint's weights are USED; they cannot add a component the
             checkpoint lacks. See `SAMVTP.set_components`.
         **config_overrides: forwarded to SAMVTPConfig. Overriding an
@@ -155,7 +155,6 @@ def describe(model: SAMVTP) -> str:
     active = model.active_components
     bits = [f"SAM-VTP {n / 1e6:.1f}M params",
             f"memory {'on, ' + str(model.num_maskmem) + ' frames' if active['memory'] else 'OFF (frame-wise)'}",
-            f"warp {'on' if active['warp'] else 'off'}",
             f"geometry {'on' if active['geometry'] else 'off'}",
             f"refine head {'on' if active['refine'] else 'off'}",
             f"multimask {'on' if model.multimask_output else 'off'}"]

@@ -30,10 +30,7 @@ def mk(t):
     g = torch.Generator().manual_seed(500 + t)
     img = torch.rand(1, 3, H, W, generator=g) * 255
     dep = torch.rand(1, 1, H, W, generator=g) * 20 + 1.0
-    pose = torch.zeros(1, 7)
-    pose[0, 6] = 1.0
-    pose[0, 0] = 0.2 * t
-    return img, dep, pose
+    return img, dep
 
 
 # -- 1. what eager does -------------------------------------------------------
@@ -42,9 +39,9 @@ eager.memory_write_every = EVERY
 eager_writes = []
 with torch.no_grad():
     for t in range(N):
-        img, dep, pose = mk(t)
+        img, dep = mk(t)
         before = eager.frame_idx
-        eager.forward_frame(img, is_init_frame=(t == 0), depth=dep, pose=pose)
+        eager.forward_frame(img, is_init_frame=(t == 0), depth=dep)
         eager_writes.append(eager.frame_idx != before)
 
 print(f"eager writes on   : {[i for i, w in enumerate(eager_writes) if w]}")
@@ -74,9 +71,9 @@ for cut in (1, 2, 4, 7):
     mixed = []
     with torch.no_grad():
         for t in range(cut):
-            img, dep, pose = mk(t)
+            img, dep = mk(t)
             before = m.frame_idx
-            m.forward_frame(img, is_init_frame=(t == 0), depth=dep, pose=pose)
+            m.forward_frame(img, is_init_frame=(t == 0), depth=dep)
             mixed.append(m.frame_idx != before)
     r = SAMVTPFullGraphReplayRunner(m, torch.device("cpu"), enabled=False,
                                     capture_nowrite=True)
