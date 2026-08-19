@@ -38,6 +38,10 @@ def main() -> int:
     ap.add_argument("--tolerance", type=float, default=1e-3)
     ap.add_argument("--rgb-only", action="store_true",
                     help="force use_geometry off")
+    ap.add_argument("--no-memory", action="store_true",
+                    help="force memory off, exercising the frame-wise capture "
+                         "path. That path has no recurrent state, so it is "
+                         "captured directly rather than after the bank fills")
     ap.add_argument("--channels-last", action="store_true",
                     help="run both models in NHWC, checking that graph capture "
                          "still agrees with eager in that layout. This does NOT "
@@ -66,8 +70,13 @@ def main() -> int:
             # models and reports the difference as a capture failure.
             torch.manual_seed(1234)
             m = SAMVTP(SAMVTPConfig()).to(device).eval()
+        switches = {}
         if a.rgb_only:
-            m.use_geometry = False
+            switches["geometry"] = False
+        if a.no_memory:
+            switches["memory"] = False
+        if switches:
+            m.set_components(**switches)
         m.memory_write_every = max(1, int(a.memory_write_every))
         if a.channels_last:
             m.to(memory_format=torch.channels_last)
@@ -77,30 +86,23 @@ def main() -> int:
     every = max(1, int(a.memory_write_every))
     # The bank fills `every` times slower, and capture waits for a full bank, so
     # a run long enough at every=1 replays nothing at every=3.
-    n = a.frames if every == 1 else max(a.frames, 24 * every)
+    n = a.frames if (every == 1 or a.no_memory) else max(a.frames, 24 * every)
     frames = [torch.randint(0, 256, (1, 3, a.size, a.size), device=device).float()
               for _ in range(n)]
 
     probe = make()
     print(describe(probe))
     needs_geom = probe.needs_geometry
-    depths = poses = None
+    depths = None
     if needs_geom:
         depths = [torch.rand(1, 1, a.size, a.size, device=device) * 20.0 + 1.0
                   for _ in range(n)]
-        poses = []
-        for t in range(n):
-            p = torch.zeros(1, 7, device=device)
-            p[0, 6] = 1.0
-            p[0, 0] = 0.15 * t          # forward
-            p[0, 1] = 0.02 * t          # slight lateral drift
-            poses.append(p)
 
     def run(model, runner=None):
         out = []
         with torch.no_grad():
             for t in range(n):
-                kw = dict(depth=depths[t], pose=poses[t]) if needs_geom else {}
+                kw = dict(depth=depths[t]) if needs_geom else {}
                 if runner is None:
                     r = model.forward_frame(frames[t], is_init_frame=(t == 0), **kw)
                 else:
@@ -113,7 +115,7 @@ def main() -> int:
     graph_model = make()
     runner = SAMVTPFullGraphReplayRunner(graph_model, device, enabled=True,
                                          capture_warmup=1,
-                                         capture_nowrite=every > 1)
+                                         capture_nowrite=every > 1 and not a.no_memory)
     graphed = run(graph_model, runner)
 
     print(runner.status_note())

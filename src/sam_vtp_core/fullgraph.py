@@ -14,6 +14,12 @@ counter becomes a device scalar, and the stored per-frame features become anothe
 stacked tensor. Once the bank is full the control flow is constant and the whole
 pass is capturable, geometry included.
 
+With memory switched off (the frame-wise ablation) none of that applies: there is
+no recurrent state, so the pass is already pure feedforward and is captured
+directly. That arm is supported so the ablation can be timed in the same regime
+as the full model -- see `_framewise` in `__init__` for why the alternative
+silently favours the memory pathway.
+
 Everything the geometry path does is fixed-shape given a fixed input size: the
 derived channels are interpolate, median, meshgrid, cross product and two box
 convolutions. The current frame's depth is a static input buffer, exactly like
@@ -34,8 +40,9 @@ once, which is the cheaper side of that trade on a device with memory to spare.
 
 Limitations
 -----------
-  * The bank must be full before capture, which `min_history_frames` enforces.
-    Warmup frames run eagerly.
+  * With memory on, the bank must be full before capture, which
+    `min_history_frames` enforces. Warmup frames run eagerly. With memory off
+    there is no bank, so warmup only has to populate the lazy caches.
   * Once capture has happened there is no going back to eager: the dict-based
     memory in `architecture.py` stops being updated, so an eager frame after a
     replayed one would read stale state. Mismatches raise instead.
@@ -88,14 +95,16 @@ class SAMVTPFullGraphReplayRunner:
         self._capture_nowrite = (int(getattr(model, "memory_write_every", 1)) > 1
                                  if capture_nowrite is None else bool(capture_nowrite))
 
-        # With memory switched off there is no recurrent state to tensorise: the
-        # bank never fills, so capture could never trigger and every frame would
-        # quietly fall through to eager. Say so instead of reporting "capture
-        # pending" forever. The frame-wise path is cheap anyway -- it skips
-        # memory attention and the memory encoder entirely.
+        # With memory switched off there is no recurrent state to tensorise, so
+        # the bank-filling handshake does not apply: the pass is pure feedforward
+        # and capturable as soon as the lazy caches are warm.
+        #
+        # This arm used to be refused outright, which quietly biased any
+        # comparison built on it -- timing the full model under replay and the
+        # frame-wise ablation eagerly charges the entire replay speedup to the
+        # frame-wise arm, making the memory pathway look cheaper than it is.
+        # Both regimes have to be available for that comparison to mean anything.
         self._framewise = not bool(getattr(model, "use_memory", True))
-        if self.enabled and self._framewise:
-            self.enabled = False
 
         self.capture_warmup = max(0, int(capture_warmup))
 
@@ -103,13 +112,20 @@ class SAMVTPFullGraphReplayRunner:
         # min(frames_seen, max_obj_ptrs_in_encoder) - 1 in the eager path, so the
         # constant used below is only correct once enough frames have gone by.
         # That is why the floor is 16 and not num_maskmem.
-        default_min_history = max(int(model.num_maskmem),
-                                  int(model.sam2_model.max_obj_ptrs_in_encoder))
+        # Neither applies with memory off: there is no bank and no object-ptr
+        # encoding, so frame-wise only needs enough eager frames to populate the
+        # lazy position-encoding caches before capture.
+        default_min_history = (2 if self._framewise else
+                               max(int(model.num_maskmem),
+                                   int(model.sam2_model.max_obj_ptrs_in_encoder)))
         self.min_history_frames = max(
             default_min_history,
             int(min_history_frames) if min_history_frames is not None else default_min_history)
 
         self._captured = False
+        # Frame-wise readiness. Memory mode signals readiness by `_state` being
+        # built; frame-wise has no state, so it counts warm eager frames instead.
+        self._framewise_ready = False
         # Component configuration the graph was captured under; compared on every
         # replay so a later switch change cannot go unnoticed.
         self._captured_component_epoch = -1
@@ -130,8 +146,6 @@ class SAMVTPFullGraphReplayRunner:
 
     def status_note(self) -> str:
         if not self.enabled:
-            if self._framewise:
-                return "CUDA Graph disabled (memory switched off: no recurrent state to capture)"
             return "CUDA Graph disabled"
         if self._capture_failed:
             return f"CUDA Graph fell back to eager (capture failed: {self._capture_error})"
@@ -145,8 +159,15 @@ class SAMVTPFullGraphReplayRunner:
                 every = int(getattr(self.model, "memory_write_every", 1))
                 cadence = (f", 2 graphs (write every {every})" if every > 1
                            else ", 2 graphs (gated writes)")
-            return f"CUDA Graph replay active (full forward{suffix}{cadence})"
+            mode = "frame-wise" if self._framewise else "full forward"
+            return f"CUDA Graph replay active ({mode}{suffix}{cadence})"
         return "CUDA Graph enabled (history warmup / capture pending)"
+
+    def _capture_ready(self) -> bool:
+        """Whether there is enough warm state to capture from."""
+        if self._framewise:
+            return self._framewise_ready
+        return self._state is not None
 
     @staticmethod
     def _graph_context(graph):
@@ -235,7 +256,7 @@ class SAMVTPFullGraphReplayRunner:
 
     def _forward_tensorized_state(self, frame: torch.Tensor,
                                   update_memory: bool = True) -> Dict[str, torch.Tensor]:
-        assert self._state is not None
+        assert self._framewise or self._state is not None
         model, core = self.model, self.model.sam2_model
         B, _, H, W = frame.shape
         image_norm = model.normalize_imagenet(frame)
@@ -251,7 +272,17 @@ class SAMVTPFullGraphReplayRunner:
                 geo.to(top.dtype), top.shape[-2:])
 
         vision_feats, vision_pos_embeds, feat_sizes = core.prepare_backbone_features(backbone_out)
-        pix_feat = self._memory_conditioned_pix_feat(vision_feats, vision_pos_embeds, feat_sizes)
+        if self._framewise:
+            # Mirrors the no-memory branch in architecture.forward_frame, which
+            # writes the token back into vision_feats[-1] rather than only into
+            # pix_feat. Nothing downstream reads vision_feats[-1] on this path,
+            # but keeping the two implementations identical is what makes
+            # verify_fullgraph_parity meaningful.
+            vision_feats[-1] = vision_feats[-1] + core.no_mem_embed
+            pix_feat = vision_feats[-1].permute(1, 2, 0).view(B, -1, *feat_sizes[-1])
+        else:
+            pix_feat = self._memory_conditioned_pix_feat(
+                vision_feats, vision_pos_embeds, feat_sizes)
 
         sparse, dense, image_pe = model._prompt_tensors(pix_feat, B)
 
@@ -313,9 +344,12 @@ class SAMVTPFullGraphReplayRunner:
     def _capture(self, frame: torch.Tensor, depth: Optional[torch.Tensor],
                  depth_valid: Optional[torch.Tensor]) -> None:
         s = self._state
-        assert s is not None
-        snap = (s.non_cond_maskmem_features.clone(), s.non_cond_maskmem_pos_enc.clone(),
-                s.non_cond_obj_ptr.clone(), s.step_idx.clone())
+        assert self._framewise or s is not None
+        # Frame-wise has no bank, so there is nothing to snapshot or restore.
+        writes = not self._framewise
+        snap = None if s is None else (
+            s.non_cond_maskmem_features.clone(), s.non_cond_maskmem_pos_enc.clone(),
+            s.non_cond_obj_ptr.clone(), s.step_idx.clone())
 
         self._static_input = torch.empty_like(frame)
         self._static_depth = torch.empty_like(depth) if depth is not None else None
@@ -329,12 +363,15 @@ class SAMVTPFullGraphReplayRunner:
             # Warmup populates the position-encoding and RoPE caches, which would
             # otherwise be built (and stored in Python dicts) mid-capture.
             for _ in range(self.capture_warmup):
-                self._forward_tensorized_state(self._static_input)
+                self._forward_tensorized_state(self._static_input, update_memory=writes)
             self._graph = torch.cuda.CUDAGraph()
             with self._graph_context(self._graph):
-                self._static_output = self._forward_tensorized_state(self._static_input)
+                self._static_output = self._forward_tensorized_state(
+                    self._static_input, update_memory=writes)
 
-            if self._capture_nowrite:
+            # A frame-wise pass never writes, so the single graph above already
+            # is the non-writing one; a second capture would be a duplicate.
+            if self._capture_nowrite and not self._framewise:
                 # Capturing this one *after* the write graph is deliberate: the
                 # write graph's capture leaves the bank shifted, and this pass
                 # only reads it, so whatever it sees is representative of a
@@ -346,10 +383,11 @@ class SAMVTPFullGraphReplayRunner:
                         self._static_input, update_memory=False)
         torch.cuda.current_stream(self.device).wait_stream(capture_stream)
 
-        s.non_cond_maskmem_features.copy_(snap[0])
-        s.non_cond_maskmem_pos_enc.copy_(snap[1])
-        s.non_cond_obj_ptr.copy_(snap[2])
-        s.step_idx.copy_(snap[3])
+        if snap is not None:
+            s.non_cond_maskmem_features.copy_(snap[0])
+            s.non_cond_maskmem_pos_enc.copy_(snap[1])
+            s.non_cond_obj_ptr.copy_(snap[2])
+            s.step_idx.copy_(snap[3])
         self._captured = True
         self._captured_component_epoch = self.model.component_epoch
 
@@ -409,9 +447,15 @@ class SAMVTPFullGraphReplayRunner:
         if (not self.enabled) or self._capture_failed:
             return eager()
 
-        if is_init_frame or self._state is None:
+        if is_init_frame or not self._capture_ready():
             out = eager()
-            if self.model.frame_idx >= self.min_history_frames:
+            if self._framewise:
+                # `frame_idx` never advances with memory off -- the eager path
+                # returns before incrementing it -- so warmth is counted on
+                # `_frames_seen`, which does advance on every frame.
+                self._framewise_ready = (
+                    self.model._frames_seen >= self.min_history_frames)
+            elif self.model.frame_idx >= self.min_history_frames:
                 self._sync_tensor_state_from_model()
             return out
 
@@ -428,6 +472,13 @@ class SAMVTPFullGraphReplayRunner:
                 return eager()
 
         writes = self._writes_this_frame(update_memory)
+        if self._framewise:
+            # Still called above so `_frames_seen` advances in step with eager,
+            # but there is only one graph and it never writes, so the cadence
+            # result carries no branch here.
+            self._copy_inputs(frame, depth, depth_valid)
+            self._graph.replay()
+            return self._static_output
         if not writes and self._graph_nowrite is None:
             raise RuntimeError(
                 "update_memory=False under CUDA-graph replay, but no non-writing "

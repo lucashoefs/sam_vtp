@@ -10,38 +10,23 @@ shapes and control flow, not by weight values, so a randomly initialised model
 times identically to a trained one. That also makes this runnable on a robot
 that does not yet have the checkpoint.
 
-WHY EVERY ARM IS TIMED EAGER
-----------------------------
-The obvious approach -- time each configuration the way it would be deployed --
-does not work here, and getting it wrong biases the result in the flattering
-direction. `SAMVTPFullGraphReplayRunner` refuses to capture when memory is off:
-
-    self._framewise = not bool(getattr(model, "use_memory", True))
-    if self.enabled and self._framewise:
-        self.enabled = False
-
-so a "deploy each arm normally" sweep would time SAM-VTP under CUDA-graph replay
-and SAM-TP eagerly. Replay is worth a large constant on any launch-bound device,
-all of which would be charged to the frame-wise arm -- making the memory pathway
-look cheaper than it is, or free. That is exactly the direction that flatters the
-paper's argument, so it is the one to refuse.
-
-Eager for every arm is the only regime all four configurations can actually run
-in, so it is what the comparison uses. It is not the regime the robot deploys
-in; the deployed full-model number is printed separately below, clearly marked,
-and the two must not be subtracted from each other.
-
-The eager numbers still answer the question the paper asks -- what fraction of
-frame compute each component is -- and on an embedded part they answer it well:
-Orin-class hardware is attention- and bandwidth-bound where a desktop GPU is
-launch-bound, so eager and replay sit much closer together there.
+Every arm is timed in both regimes -- eager, and under CUDA-graph replay -- and
+the two are reported side by side. Reporting only one is what makes this
+measurement easy to get wrong: replay is worth a large constant on a
+launch-bound device, so timing the full model under replay against a frame-wise
+arm running eagerly charges that entire constant to the frame-wise arm and makes
+the memory pathway look far cheaper than it is. `fullgraph.py` used to refuse to
+capture the frame-wise configuration at all, which left that mismatched
+comparison as the only one available; it now captures both, so the deployed-
+regime column is a like-for-like comparison and is the one to quote.
 
     python scripts/bench_components.py                     # 512x512, fp16
-    python scripts/bench_components.py --frames 200 --no-graph
+    python scripts/bench_components.py --frames 200
 """
 from __future__ import annotations
 
 import argparse
+import gc
 import statistics
 import sys
 from pathlib import Path
@@ -69,35 +54,65 @@ ARMS: Tuple[Tuple[str, bool, bool], ...] = (
 )
 
 
+def _stats(samples: List[float]) -> Dict[str, float]:
+    samples = sorted(samples)
+    return {"median": statistics.median(samples),
+            "p10": samples[int(0.10 * (len(samples) - 1))],
+            "p90": samples[int(0.90 * (len(samples) - 1))]}
+
+
 def bench_arm(model: SAMVTP, dev: torch.device, mk, *, memory: bool, geometry: bool,
-              warmup: int, frames: int, amp: Optional[torch.dtype]) -> Dict[str, float]:
-    """Median ms/frame for one configuration, timed eagerly.
+              warmup: int, frames: int, amp: Optional[torch.dtype],
+              want_graph: bool) -> Dict[str, object]:
+    """Median ms/frame for one configuration, eager and under graph replay.
 
     Memory-on arms need the bank filled before the steady-state cost is real --
     an unfilled bank means fewer keys in memory attention and an optimistic
     number -- so warmup is at least num_maskmem frames regardless of --warmup.
     """
     model.set_components(memory=memory, geometry=geometry)
-    model.reset_memory()
-
-    ctx = (torch.autocast("cuda", dtype=amp)
-           if dev.type == "cuda" and amp is not None else torch.no_grad())
+    ctx = lambda: (torch.autocast("cuda", dtype=amp)  # noqa: E731
+                   if dev.type == "cuda" and amp is not None else torch.no_grad())
+    dep_or_none = lambda d: d if geometry else None  # noqa: E731
     need = max(warmup, int(model.num_maskmem) + 3) if memory else warmup
 
-    with torch.no_grad(), ctx:
+    if dev.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(dev)
+
+    model.reset_memory()
+    with torch.no_grad(), ctx():
         for t in range(need):
             img, dep = mk(t)
-            model.forward_frame(img, is_init_frame=(t == 0),
-                                depth=dep if geometry else None)
+            model.forward_frame(img, is_init_frame=(t == 0), depth=dep_or_none(dep))
         img, dep = mk(need)
-        samples = timed(
-            lambda: model.forward_frame(img, depth=dep if geometry else None),
-            frames, dev)
+        eager = _stats(timed(
+            lambda: model.forward_frame(img, depth=dep_or_none(dep)), frames, dev))
 
-    samples.sort()
-    return {"median": statistics.median(samples),
-            "p10": samples[int(0.10 * (len(samples) - 1))],
-            "p90": samples[int(0.90 * (len(samples) - 1))]}
+    out: Dict[str, object] = {"eager": eager, "replay": None, "status": "not attempted",
+                              "peak_mb": 0.0}
+    if not (want_graph and dev.type == "cuda"):
+        return out
+
+    model.reset_memory()
+    runner = SAMVTPFullGraphReplayRunner(model, dev, enabled=True, capture_warmup=2)
+    with torch.no_grad(), ctx():
+        for t in range(max(need, runner.min_history_frames + 3)):
+            img, dep = mk(t)
+            runner.run(img, is_init_frame=(t == 0), depth=dep_or_none(dep))
+        out["status"] = runner.status_note()
+        if runner._captured:
+            img, dep = mk(99)
+            out["replay"] = _stats(timed(
+                lambda: runner.run(img, is_init_frame=False, depth=dep_or_none(dep)),
+                frames, dev))
+    out["peak_mb"] = torch.cuda.max_memory_reserved(dev) / 2**20
+
+    # Each arm captures its own graphs into its own pool. On an 8 GB Orin four
+    # live pools is not free, so drop this one before the next arm builds its.
+    del runner
+    gc.collect()
+    torch.cuda.empty_cache()
+    return out
 
 
 def main() -> int:
@@ -113,7 +128,7 @@ def main() -> int:
                     help="NHWC, as tune_for_inference does in deployment (default)")
     ap.add_argument("--no-channels-last", dest="channels_last", action="store_false")
     ap.add_argument("--no-graph", action="store_true",
-                    help="skip the deployed full-model graph-replay reference")
+                    help="eager only; skips the deployed-regime column")
     ap.add_argument("--allow-busy-gpu", action="store_true")
     args = ap.parse_args()
 
@@ -149,51 +164,52 @@ def main() -> int:
         img0 = img0.to(memory_format=torch.channels_last)
     mk = lambda t: (img0, dep0)  # noqa: E731
 
-    results: List[Tuple[str, bool, bool, Dict[str, float]]] = []
+    results = []
     for label, mem, geo in ARMS:
-        r = bench_arm(model, dev, mk, memory=mem, geometry=geo,
-                      warmup=args.warmup, frames=args.frames, amp=amp)
+        r = bench_arm(model, dev, mk, memory=mem, geometry=geo, warmup=args.warmup,
+                      frames=args.frames, amp=amp, want_graph=not args.no_graph)
         results.append((label, mem, geo, r))
+        print(f"  [{label.strip():22s}] {r['status']}")
 
-    full = results[-1][3]["median"]
     scale = (args.height * args.width) / (512 * 512)
     gf = GFLOP_AT_512 * scale
+    captured = [r for _, _, _, r in results if r["replay"] is not None]
+    all_captured = len(captured) == len(results)
 
-    print(f"\n--- per-frame cost, eager, {args.height}x{args.width}, {args.amp} " + "-" * 18)
-    print(f"  {'configuration':22s} {'ms':>8s} {'FPS':>7s} {'p10-p90':>14s} {'vs full':>9s}")
+    print(f"\n--- per-frame cost, {args.height}x{args.width}, {args.amp} " + "-" * 30)
+    print(f"  {'configuration':22s} {'eager ms':>9s} {'replay ms':>10s} "
+          f"{'FPS':>7s} {'vs full':>9s} {'peak MB':>9s}")
+    full_key = "replay" if all_captured else "eager"
+    full = results[-1][3][full_key]["median"]
     for label, mem, geo, r in results:
-        rel = "--" if r["median"] == full else f"{100 * (r['median'] - full) / full:+.1f}%"
-        print(f"  {label:22s} {r['median']:8.2f} {1000 / r['median']:7.2f} "
-              f"{r['p10']:6.2f}-{r['p90']:6.2f} {rel:>9s}")
+        rep = r["replay"]
+        best = (rep or r["eager"])["median"]
+        rep_s = f"{rep['median']:10.2f}" if rep else f"{'--':>10s}"
+        rel = "--" if best == full else f"{100 * (best - full) / full:+.1f}%"
+        print(f"  {label:22s} {r['eager']['median']:9.2f} {rep_s} "
+              f"{1000 / best:7.2f} {rel:>9s} {r['peak_mb']:9.0f}")
+    print(f"  FPS and 'vs full' use the {full_key} column"
+          + ("" if all_captured else "  (not every arm captured -- see status above)"))
 
-    by = {(m, g): r["median"] for _, m, g, r in results}
-    print("\n--- what each component costs " + "-" * 42)
-    for name, on, off, cond in (
-            ("memory",   (True, False), (False, False), "geometry off"),
-            ("memory",   (True, True),  (False, True),  "geometry on"),
-            ("geometry", (False, True), (False, False), "memory off"),
-            ("geometry", (True, True),  (True, False),  "memory on")):
-        d = by[on] - by[off]
-        print(f"  {name:9s} with {cond:13s} {d:+7.2f} ms  "
-              f"({100 * d / by[on]:5.1f}% of that frame)")
+    for regime in (["eager", "replay"] if all_captured else ["eager"]):
+        by = {(m, g): r[regime]["median"] for _, m, g, r in results}
+        print(f"\n--- what each component costs, {regime} " + "-" * (41 - len(regime)))
+        for name, on, off, cond in (
+                ("memory",   (True, False), (False, False), "geometry off"),
+                ("memory",   (True, True),  (False, True),  "geometry on"),
+                ("geometry", (False, True), (False, False), "memory off"),
+                ("geometry", (True, True),  (True, False),  "memory on")):
+            d = by[on] - by[off]
+            print(f"  {name:9s} with {cond:13s} {d:+7.2f} ms  "
+                  f"({100 * d / by[on]:5.1f}% of that frame)")
 
-    if not args.no_graph and dev.type == "cuda":
-        model.set_components(memory=True, geometry=True)
-        model.reset_memory()
-        runner = SAMVTPFullGraphReplayRunner(model, dev, enabled=True, capture_warmup=2)
-        with torch.no_grad(), (torch.autocast("cuda", dtype=amp) if amp else torch.no_grad()):
-            for t in range(max(args.warmup, runner.min_history_frames + 3)):
-                i, d = mk(t)
-                runner.run(i, is_init_frame=(t == 0), depth=d)
-            i, d = mk(99)
-            g = statistics.median(timed(
-                lambda: runner.run(i, is_init_frame=False, depth=d), args.frames, dev))
-        print("\n--- deployed full model, graph replay " + "-" * 34)
-        print(f"  graph status    {runner.status_note()}")
-        print(f"  full + replay   {g:8.2f} ms  {1000 / g:6.2f} FPS  "
-              f"({full / g:.2f}x over its own eager number)")
-        print("  NOT comparable with the eager arms above -- the frame-wise arms")
-        print("  cannot be graph-captured, so do not subtract across the two blocks.")
+    if all_captured:
+        print("\n  Both regimes are like-for-like: every arm above was captured, so the"
+              "\n  replay column is a fair deployed-regime comparison. Quote that one.")
+    else:
+        print("\n  Some arm did not capture, so the replay column is NOT like-for-like."
+              "\n  Do not subtract a replayed number from an eager one; use the eager"
+              "\n  column, which every arm can run in.")
 
     print(f"\nFLOP budget at {args.height}x{args.width}: {gf:.1f} GFLOP/frame "
           f"(53% image encoder, 42% memory attention, 5% everything else)")
