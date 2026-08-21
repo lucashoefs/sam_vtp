@@ -91,6 +91,12 @@ class SAMVTPConfig:
     mem_dim: int = 64           # compressed width memory is stored at
 
     # -- memory --------------------------------------------------------------
+    # False describes a SAM-TP checkpoint, which carries no memory weights at
+    # all. That is a different architecture from a SAM-VTP checkpoint run with
+    # `set_components(memory=False)`: the latter still holds memory weights it
+    # was trained alongside. Inferred from the checkpoint in
+    # `config_from_state_dict`; do not set it by hand.
+    use_memory: bool = True
     num_maskmem: int = 7        # 1 conditioning frame + 6 rolling frames
     memory_attention_layers: int = 4
     dim_feedforward: int = 2048
@@ -862,8 +868,12 @@ class MaskDecoder(nn.Module):
         self.iou_token = nn.Embedding(1, d)
         self.num_mask_tokens = cfg.num_multimask_outputs + 1
         self.mask_tokens = nn.Embedding(self.num_mask_tokens, d)
-        self.pred_obj_scores = True
-        self.obj_score_token = nn.Embedding(1, d)
+        # SAM 2 emits an object-score token ahead of the IoU and mask tokens,
+        # but it exists to serve the memory pathway and a SAM-TP checkpoint has
+        # neither. Dropping it shortens the token sequence by one, which moves
+        # every index read out of the transformer below.
+        self.pred_obj_scores = bool(cfg.use_memory)
+        self.obj_score_token = nn.Embedding(1, d) if cfg.use_memory else None
         self.use_multimask_token_for_obj_ptr = True
         self.output_upscaling = nn.Sequential(
             nn.ConvTranspose2d(d, d // 4, kernel_size=2, stride=2),
@@ -878,7 +888,7 @@ class MaskDecoder(nn.Module):
         self.output_hypernetworks_mlps = nn.ModuleList(
             [MLP(d, d, d // 8, 3) for _ in range(self.num_mask_tokens)])
         self.iou_prediction_head = MLP(d, 256, self.num_mask_tokens, 3, sigmoid_output=True)
-        self.pred_obj_score_head = MLP(d, d, 1, 3)
+        self.pred_obj_score_head = MLP(d, d, 1, 3) if cfg.use_memory else None
 
     def forward(self, image_embeddings, image_pe, sparse_prompt_embeddings,
                 dense_prompt_embeddings, multimask_output: bool, repeat_image: bool,
@@ -900,8 +910,9 @@ class MaskDecoder(nn.Module):
 
     def predict_masks(self, image_embeddings, image_pe, sparse_prompt_embeddings,
                       dense_prompt_embeddings, repeat_image, high_res_features=None):
+        lead = [self.obj_score_token.weight] if self.pred_obj_scores else []
         output_tokens = torch.cat(
-            [self.obj_score_token.weight, self.iou_token.weight, self.mask_tokens.weight], dim=0)
+            lead + [self.iou_token.weight, self.mask_tokens.weight], dim=0)
         output_tokens = output_tokens.unsqueeze(0).expand(sparse_prompt_embeddings.size(0), -1, -1)
         tokens = torch.cat((output_tokens, sparse_prompt_embeddings), dim=1)
 
@@ -925,8 +936,9 @@ class MaskDecoder(nn.Module):
         b, c, h, w = src.shape
 
         hs, src = self.transformer(src, pos_src, tokens)
-        iou_token_out = hs[:, 1, :]
-        mask_tokens_out = hs[:, 2 : (2 + self.num_mask_tokens), :]
+        i0 = 1 if self.pred_obj_scores else 0  # skip the object-score token if present
+        iou_token_out = hs[:, i0, :]
+        mask_tokens_out = hs[:, i0 + 1 : i0 + 1 + self.num_mask_tokens, :]
 
         src = src.transpose(1, 2).view(b, c, h, w)
         dc1, ln1, act1, dc2, act2 = self.output_upscaling
@@ -941,7 +953,10 @@ class MaskDecoder(nn.Module):
         masks = (hyper_in @ upscaled.view(b, c, h * w)).view(b, -1, h, w)
 
         iou_pred = self.iou_prediction_head(iou_token_out)
-        object_score_logits = self.pred_obj_score_head(hs[:, 0, :])
+        # None when there is no memory to serve. Every caller on this forward
+        # path discards it; `encode_new_memory` is given a freshly computed one.
+        object_score_logits = (
+            self.pred_obj_score_head(hs[:, 0, :]) if self.pred_obj_scores else None)
         return masks, iou_pred, mask_tokens_out, object_score_logits
 
 
@@ -972,8 +987,12 @@ class SAM2Core(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.image_encoder = ImageEncoder(cfg)
-        self.memory_attention = MemoryAttention(cfg)
-        self.memory_encoder = MemoryEncoder(cfg)
+        # Absent rather than randomly initialised for a SAM-TP checkpoint. The
+        # frame-wise forward path never reaches them, and building them anyway
+        # would make the strict load in `load_checkpoint` report 166 missing
+        # tensors for a checkpoint that is in fact complete.
+        self.memory_attention = MemoryAttention(cfg) if cfg.use_memory else None
+        self.memory_encoder = MemoryEncoder(cfg) if cfg.use_memory else None
 
         self.hidden_dim = cfg.d_model
         self.mem_dim = cfg.mem_dim
@@ -987,23 +1006,34 @@ class SAM2Core(nn.Module):
         self.directly_add_no_mem_embed = True
 
         # Downsamples a mask prompt to the low-res logit stride. Unused on this
-        # forward path but present in every checkpoint, so it is built to keep
-        # the load strict.
-        self.mask_downsample = nn.Conv2d(1, 1, kernel_size=4, stride=4)
+        # forward path but present in every memory-carrying checkpoint, so it is
+        # built to keep the load strict.
+        self.mask_downsample = (
+            nn.Conv2d(1, 1, kernel_size=4, stride=4) if cfg.use_memory else None)
 
-        self.maskmem_tpos_enc = nn.Parameter(torch.zeros(cfg.num_maskmem, 1, 1, cfg.mem_dim))
+        # These two are in every checkpoint, memory or not: the frame-wise path
+        # adds no_mem_embed to the coarsest features on every frame.
         self.no_mem_embed = nn.Parameter(torch.zeros(1, 1, cfg.d_model))
         self.no_mem_pos_enc = nn.Parameter(torch.zeros(1, 1, cfg.d_model))
-        self.no_obj_ptr = nn.Parameter(torch.zeros(1, cfg.d_model))
-        self.no_obj_embed_spatial = nn.Parameter(torch.zeros(1, cfg.mem_dim))
-        for p in (self.maskmem_tpos_enc, self.no_mem_embed, self.no_mem_pos_enc,
-                  self.no_obj_ptr, self.no_obj_embed_spatial):
+        init = [self.no_mem_embed, self.no_mem_pos_enc]
+
+        if cfg.use_memory:
+            self.maskmem_tpos_enc = nn.Parameter(
+                torch.zeros(cfg.num_maskmem, 1, 1, cfg.mem_dim))
+            self.no_obj_ptr = nn.Parameter(torch.zeros(1, cfg.d_model))
+            self.no_obj_embed_spatial = nn.Parameter(torch.zeros(1, cfg.mem_dim))
+            init += [self.maskmem_tpos_enc, self.no_obj_ptr, self.no_obj_embed_spatial]
+        else:
+            self.maskmem_tpos_enc = self.no_obj_ptr = self.no_obj_embed_spatial = None
+        for p in init:
             nn.init.trunc_normal_(p, std=0.02)
 
         self.sam_prompt_encoder = LearnedPrompt(cfg)
         self.sam_mask_decoder = MaskDecoder(cfg)
-        self.obj_ptr_proj = MLP(cfg.d_model, cfg.d_model, cfg.d_model, 3)
-        self.obj_ptr_tpos_proj = nn.Linear(cfg.d_model, cfg.mem_dim)
+        self.obj_ptr_proj = (
+            MLP(cfg.d_model, cfg.d_model, cfg.d_model, 3) if cfg.use_memory else None)
+        self.obj_ptr_tpos_proj = (
+            nn.Linear(cfg.d_model, cfg.mem_dim) if cfg.use_memory else None)
 
     # -- image ---------------------------------------------------------------
     def forward_image(self, img_batch: torch.Tensor) -> Dict[str, Any]:
@@ -1538,10 +1568,10 @@ class SAMVTP(nn.Module):
         # switch can only ever turn a component off or back on -- it cannot
         # conjure weights the checkpoint does not carry, and set_components()
         # refuses rather than running a randomly-initialised module.
-        self.use_memory = True
+        self.use_memory = bool(cfg.use_memory)
         self.use_refine_head = cfg.use_refine_head
         self._trained_components: Dict[str, bool] = {
-            "memory": True,                    # any SAM-VTP checkpoint has memory
+            "memory": bool(cfg.use_memory),    # False for a SAM-TP checkpoint
             "geometry": bool(cfg.use_geometry),
             "refine": bool(cfg.use_refine_head),
         }
@@ -1678,6 +1708,7 @@ class SAMVTP(nn.Module):
             return self
 
         missing = {
+            "memory": self.sam2_model.memory_attention is None,
             "geometry": self.geometry_encoder is None,
             "refine": self.refine_head is None,
         }
@@ -2016,6 +2047,7 @@ class SAMVTP(nn.Module):
         cfg_kwargs: Dict[str, Any] = dict(
             use_refine_head=has("refine_head."),
             use_geometry=has("geometry_encoder."),
+            use_memory=has("sam2_model.memory_attention."),
         )
         if cfg_kwargs["use_refine_head"]:
             cfg_kwargs["refine_head_channels"] = int(state["refine_head.out.weight"].shape[1])
