@@ -163,20 +163,8 @@ decoder are accepted and ignored. A checkpoint carrying SAM 2's
 `point_embeddings` / `mask_downscaling` weights is a different model and won't
 load.
 
-**Memory is read without geometric alignment.** SAM 2 tags each memory slot with
-a position encoding that is a pure function of grid index, giving memory
-attention the prior "token *k* in memory is token *k* now". On a forward-driving
-robot that is false every frame, since the field flows outward and rescales. An
-earlier revision resampled stored features into the current camera frame using
-depth and pose to supply the correspondence explicitly. It was removed: measured
-at 1000 sequence windows it moved fuzzy Jaccard by +0.0016 (95% CI
-[-0.0035, +0.0002], not significant, and smaller than twice the seed-to-seed
-spread) while requiring a camera pose at inference. Attention recovers the
-correspondence from content well enough that paying a localisation dependency for
-it is not worth it.
-
 Checkpoints load **strictly**, and the architecture is read back from the weights
-rather than from flags — the geometry encoder and refinement head are top-level
+rather than from flags, the geometry encoder and refinement head are top-level
 modules, so a lenient load would drop all of their tensors silently
 and run an ablated model under the full model's name.
 
