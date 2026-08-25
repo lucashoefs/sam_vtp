@@ -147,13 +147,32 @@ def check_sdpa(dev: torch.device, feat_tokens: int, mem_tokens: int) -> None:
     if dev.type != "cuda":
         print("  (cuda only)")
         return
+    query_avail = None
     try:
         from torch.backends.cuda import (can_use_flash_attention,
                                          can_use_efficient_attention, SDPAParams)
         from torch.nn.attention import sdpa_kernel, SDPBackend
+        _CTX = {"math": lambda: sdpa_kernel([SDPBackend.MATH]),
+                "mem_efficient": lambda: sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION]),
+                "flash": lambda: sdpa_kernel([SDPBackend.FLASH_ATTENTION])}
+
+        def query_avail(q, k, v):
+            p = SDPAParams(q, k, v, None, 0.0, False, False)
+            return (f"flash={can_use_flash_attention(p, False)} "
+                    f"mem_efficient={can_use_efficient_attention(p, False)}")
     except ImportError:
-        print("  torch too old to introspect backend selection; skipping")
-        return
+        # Legacy API (torch 2.0-2.2). It cannot answer "is this backend legal
+        # for these shapes" up front, so we find out by running it: an illegal
+        # backend raises, and the except arm below reports it as unavailable.
+        from torch.backends.cuda import sdp_kernel
+        _CTX = {
+            "math": lambda: sdp_kernel(enable_math=True, enable_flash=False,
+                                       enable_mem_efficient=False),
+            "mem_efficient": lambda: sdp_kernel(enable_math=False, enable_flash=False,
+                                                enable_mem_efficient=True),
+            "flash": lambda: sdp_kernel(enable_math=False, enable_flash=True,
+                                        enable_mem_efficient=False)}
+        print("  (torch < 2.3: no up-front availability query; probing by execution)")
 
     shapes = [
         ("memory cross-attn", 1, 1, feat_tokens, mem_tokens, 256),
@@ -165,19 +184,15 @@ def check_sdpa(dev: torch.device, feat_tokens: int, mem_tokens: int) -> None:
         v = torch.randn(B, h, M, d, device=dev, dtype=torch.float16)
         gf = 2 * 2 * B * h * N * M * d / 1e9
         try:
-            p = SDPAParams(q, k, v, None, 0.0, False, False)
-            avail = (f"flash={can_use_flash_attention(p, False)} "
-                     f"mem_efficient={can_use_efficient_attention(p, False)}")
+            avail = query_avail(q, k, v) if query_avail else "(probed below)"
         except Exception:
             avail = "(availability query unsupported)"
         print(f"  {name}: q({N},{d}) k({M},{d})   {avail}")
 
         best = None
-        for label, backend in [("math", SDPBackend.MATH),
-                               ("mem_efficient", SDPBackend.EFFICIENT_ATTENTION),
-                               ("flash", SDPBackend.FLASH_ATTENTION)]:
+        for label in ("math", "mem_efficient", "flash"):
             try:
-                with sdpa_kernel([backend]):
+                with _CTX[label]():
                     for _ in range(3):
                         F.scaled_dot_product_attention(q, k, v)
                     torch.cuda.synchronize()
@@ -265,7 +280,8 @@ def stage_breakdown(model: SAMVTP, img, dep, dev, n: int) -> None:
 
         pix = core.prepare_memory_conditioned_features(
             frame_idx=model.frame_idx, current_vision_feats=[vf[-1]],
-            current_vision_pos_embeds=[vp[-1]], feat_sizes=[fs[-1]], output_dict=shadow)
+            current_vision_pos_embeds=[vp[-1]], feat_sizes=[fs[-1]],
+            output_dict=model.output_dict)
         sparse, dense, pe = model._prompt_tensors(pix, 1)
         hrf = [f.permute(1, 2, 0).view(1, -1, *s) for f, s in zip(vf[:-1], fs[:-1])]
         stages["mask decoder"] = lambda: core.sam_mask_decoder(
