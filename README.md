@@ -15,6 +15,10 @@ depending only on PyTorch, and **the label pipeline**
 (`src/sam_vtp_core/labels/`), which builds the continuous training target from
 simulator depth and semantics.
 
+The ROS 2 stack that runs this on a robot (camera, planner, controller, safety
+gate) is a separate repository:
+[sam_vtp_jetacker](https://github.com/lucashoefs/sam_vtp_jetacker).
+
 ## Install
 
 ```bash
