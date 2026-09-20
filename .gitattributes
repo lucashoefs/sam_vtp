@@ -1,0 +1,14 @@
+# Normalise to LF in the repository; check out native. Without this the tree
+# carries a mix of CRLF and LF and every cross-platform edit shows as a
+# whole-file diff.
+* text=auto
+
+*.py   text diff=python
+*.md   text
+*.yaml text
+*.toml text
+*.txt  text
+
+*.png  binary
+*.pt   binary
+*.npz  binary
