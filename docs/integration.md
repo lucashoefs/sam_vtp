@@ -11,7 +11,7 @@ channels are a function of depth and intrinsics alone. Supply your own
 intrinsics, at the resolution they were calibrated at.
 
 ```python
-from sam_vtp_core import CameraIntrinsics, build_model
+from sam_vtp import CameraIntrinsics, build_model
 
 cam = CameraIntrinsics.from_K(camera_info.k, width=848, height=480)   # NATIVE resolution
 model = build_model("sam_vtp.pt", device=dev, camera=cam)
@@ -25,7 +25,7 @@ every height while still looking plausible.
 ## Depth
 
 ```python
-from sam_vtp_core import depth_from_uint16_mm
+from sam_vtp import depth_from_uint16_mm
 
 depth_m, valid = depth_from_uint16_mm(aligned_depth_16uc1)   # 0 means no return
 result = stream.step(rgb, depth=depth_m, depth_valid=valid)

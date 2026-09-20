@@ -1,27 +1,36 @@
-This product includes software derived from SAM 2 (Segment Anything in Images
-and Videos), Copyright (c) Meta Platforms, Inc. and affiliates, released under
-the Apache License 2.0:
+This product builds on SAM 2 (Segment Anything in Images and Videos),
+Copyright (c) Meta Platforms, Inc. and affiliates, released under the Apache
+License 2.0:
 
     https://github.com/facebookresearch/sam2
 
-`src/sam_vtp_core/architecture.py` reproduces, in condensed form, the layer
-definitions of SAM 2's Hiera image encoder, FPN neck, memory attention, memory
-encoder and mask decoder, together with the memory read/write logic of
-`SAM2Base`. Parameter names are preserved so that SAM 2 pretrained weights and
-SAM-VTP checkpoints remain loadable.
+SAM 2 is consumed as a pinned git submodule at `third_party/sam2` and is not
+redistributed in this repository; it retains its own LICENSE. `sam_vtp` imports
+its modules directly and subclasses or replaces a small number of them:
 
-Modifications relative to SAM 2:
+  * `sam_vtp.modeling.sam_vtp_base.SAMVTPBase` subclasses `sam2.modeling
+    .sam2_base.SAM2Base`, replacing the interactive prompt encoder with a fixed
+    learned prompt (`sam_vtp.modeling.prompt.LearnedPrompt`) and overriding
+    `prepare_memory_conditioned_features` for streaming use.
+  * `sam_vtp.modeling.patches` subclasses SAM 2's Hiera trunk, sinusoidal
+    position encoding and RoPE attention to add caching and to fix the rotary
+    frequency table for a streaming memory bank.
 
-  * The interactive prompt encoder is replaced by a fixed learned prompt
-    (`LearnedPrompt`), since traversability has no user click.
-  * Memory features are resampled into the current camera frame using depth and
-    relative pose before memory attention (ego-motion warp).
+Behavioural differences relative to SAM 2, each marked "DIVERGENCE n" in the
+source:
+
+  * The prompt is learned rather than clicked, since traversability has no user.
+    Point coordinates passed to the decoder are accepted and ignored.
   * Depth-derived geometry channels are added to the coarsest backbone level.
   * A full-resolution RGB-guided residual head refines the decoder's output.
+  * `no_mem_embed` is written back into the vision features, the object score
+    comes from the prediction itself, and the object-pointer temporal horizon is
+    clamped by frames actually seen rather than by total clip length -- all three
+    required for streaming, where the clip length is not known in advance.
+  * The mask is upsampled to the input resolution rather than to `image_size`.
   * Interactive-tracking paths not used by SAM-VTP (click refinement, reverse
     tracking, mask-as-output, non-overlap constraints, multi-object batching)
-    are removed.
-  * Hydra/OmegaConf configuration is replaced by a plain dataclass.
+    are not exercised.
 
 A copy of the Apache License 2.0 is available at:
 
