@@ -16,7 +16,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .architecture import SAMVTP
+from .modeling.sam_vtp import SAMVTP
 from .fullgraph import SAMVTPFullGraphReplayRunner
 from .inference import compatible_input_hw
 

@@ -12,7 +12,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from .architecture import SAMVTP
+from .modeling.sam_vtp import SAMVTP
 from .fullgraph import SAMVTPFullGraphReplayRunner
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}

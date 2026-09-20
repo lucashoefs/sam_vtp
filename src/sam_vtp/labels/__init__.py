@@ -4,7 +4,7 @@
 `generate` combines that prior with depth-derived slope, roughness and height
 into the dense target `y in [0, 1]` the model is trained on.
 
-    python -m sam_vtp_core.labels.generate --root /data/tartanground
+    python -m sam_vtp.labels.generate --root /data/tartanground
 
 These modules need `opencv-python`, which the base install does not pull in:
 

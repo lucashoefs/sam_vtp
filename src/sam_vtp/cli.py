@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 
-from .factory import build_model, describe
+from .build import build_model, describe
 from .inference import infer_sequence, list_depths, list_images
 
 
@@ -99,3 +99,7 @@ def main() -> int:
     print(f"graph status : {stats['graph_status']}")
     print(f"outputs      : {Path(args.output_dir).expanduser().resolve()}")
     return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

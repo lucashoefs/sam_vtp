@@ -71,7 +71,7 @@ Expected input layout (TartanGround)
 
 Output: `<traj>/trav_lcam_front/{frame:06d}_lcam_front_trav.png`
 
-    python -m sam_vtp_core.labels.generate --root /data/tartanground --workers 24
+    python -m sam_vtp.labels.generate --root /data/tartanground --workers 24
 """
 
 from __future__ import annotations

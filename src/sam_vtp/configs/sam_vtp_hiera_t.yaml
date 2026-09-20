@@ -1,0 +1,38 @@
+model:
+  geometry_hw: 256
+  # Declared here rather than left to the constructor default so that
+  # build_model() can override them through OmegaConf under struct mode.
+  input_normalization_mode: "0_255"
+  memory_write_every: 1
+  geometry_encoder:
+    _target_: sam_vtp.modeling.geometry.GeometryEncoder
+    in_channels: 5
+    out_channels: 256
+    stride: 8
+    width: 32
+  refine_head:
+    _target_: sam_vtp.modeling.refine.RefinementHead
+    channels: 8
+
+  sam2_model:
+    _target_: sam_vtp.modeling.sam_vtp_base.SAMVTPBase
+    num_prompt_tokens: 4
+    multimask_output_in_sam: false
+    multimask_output_for_tracking: false
+    memory_temporal_stride_for_eval: 1
+    max_obj_ptrs_in_encoder: 16
+    image_encoder:
+      trunk:
+        _target_: sam_vtp.modeling.patches.CachedHiera
+      neck:
+        position_encoding:
+          _target_: sam_vtp.modeling.patches.CachedPositionEmbeddingSine
+    memory_attention:
+      layer:
+        self_attention:
+          _target_: sam_vtp.modeling.patches.RoPEAttentionVTP
+        cross_attention:
+          _target_: sam_vtp.modeling.patches.RoPEAttentionVTP
+    memory_encoder:
+      position_encoding:
+        _target_: sam_vtp.modeling.patches.CachedPositionEmbeddingSine

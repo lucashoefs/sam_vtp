@@ -8,6 +8,10 @@ __pycache__/
 venv/
 .env
 
+# Throwaway environments used to test the built wheel / sdist
+.release_test/
+.wheel_test/
+
 # Packaging
 build/
 dist/

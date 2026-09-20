@@ -8,24 +8,23 @@ version = "0.2.0"
 description = "Temporally consistent continuous traversability prediction from video"
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.8"
-
-# The network is defined in-tree and needs nothing but torch. numpy and Pillow
-# are for image I/O in the inference helpers, not for the model.
-dependencies = [
-  "torch>=2.0",
-  "numpy>=1.21",
-  "Pillow>=9.0",
-]
+# 3.10 is SAM 2's floor, inherited through the submodule.
+requires-python = ">=3.10"
+dependencies = ["torch>=2.0", "numpy>=1.21", "Pillow>=9.0", "hydra-core>=1.3", "omegaconf>=2.3"]
 
 [project.optional-dependencies]
-# Only the label pipeline needs OpenCV.
 labels = ["opencv-python>=4.5"]
 
 [project.scripts]
-sam-vtp-infer = "sam_vtp_core.cli:main"
-sam-vtp-smoke = "sam_vtp_core.smoke:main"
-sam-vtp-labels = "sam_vtp_core.labels.generate:main"
+sam-vtp-infer = "sam_vtp.cli:main"
+sam-vtp-smoke = "sam_vtp.smoke:main"
+sam-vtp-labels = "sam_vtp.labels.generate:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# build_config() loads the delta YAML at runtime via importlib.resources, so it
+# has to ship inside the package. Without this a non-editable install imports
+# fine and then fails on the first build_model().
+[tool.setuptools.package-data]
+"sam_vtp" = ["configs/*.yaml"]
