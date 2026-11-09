@@ -19,7 +19,7 @@ The target is assembled as
 
 so semantics say what the surface *is* and geometry says what state it is *in*.
 Neither alone suffices, which is the point: a concrete floor is 1.00 flat and
-0.30 at 30 degrees, and grass and a tree trunk carry the same class label in
+0.30 at 35 degrees, and grass and a tree trunk carry the same class label in
 every forest environment in TartanGround.
 
 Design decisions

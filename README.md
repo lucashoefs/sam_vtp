@@ -1,237 +1,153 @@
 # SAM-VTP
 
-Traversability prediction from a video stream. Output is continuous rather than
-binary: each pixel gets a value in `[0,1]` meaning expected cost-free progress
-for a given platform, so fresh asphalt and a 25 degree gravel slope don't
-collapse to the same "drivable" label.
+Continuous traversability segmentation from RGB-D video. SAM-VTP builds on [SAM 2](https://github.com/facebookresearch/sam2), adapting its video memory for prompt-free prediction and fusing geometry measured from depth, to produce a per-pixel score in `[0,1]` at each frame. It requires no pose or odometry.
 
-The model keeps a short memory across frames so the prediction stays stable while
-the camera moves, and reads it with attention over content rather than over image
-coordinates. It takes RGB and metric depth; it needs no pose, odometry or
-localisation of any kind.
+The ROS 2 deployment stack is in [sam_vtp_jetacker](https://github.com/lucashoefs/sam_vtp_jetacker).
 
-This repository builds on **SAM 2 as a pinned git submodule**.
-
-The ROS 2 stack that runs this on a robot (camera, planner, controller, safety
-gate) is a separate repository:
-[sam_vtp_jetacker](https://github.com/lucashoefs/sam_vtp_jetacker).
+Measured at 512x512 with a full memory bank and CUDA graph replay: 21.4 FPS on a Jetson Orin Nano and 30.1 FPS on a Jetson AGX Orin.
 
 ## Install
 
-```bash
-git clone --recurse-submodules <repository-url>
-cd sam_vtp
+Requires Python 3.10+ and [PyTorch](https://pytorch.org/get-started/locally/) 2.0+. SAM 2 is a pinned submodule, and `build_config()` raises an error if it has moved.
 
-# PyTorch first, for your CUDA build: https://pytorch.org/get-started/locally/
-pip install -e third_party/sam2    # the pinned SAM 2; not on PyPI
-pip install -e .                   # model + inference
-pip install -e ".[labels]"         # also the label pipeline (adds OpenCV)
+```bash
+git clone --recurse-submodules https://github.com/lucashoefs/sam_vtp.git
+cd sam_vtp
+pip install -e third_party/sam2
+pip install -e .            # model and inference
+pip install -e ".[labels]"  # adds the label pipeline (OpenCV)
 ```
 
-Python 3.10+ (SAM 2's floor), PyTorch 2.0+. If you already cloned without
-`--recurse-submodules`, run `git submodule update --init --recursive` first.
+Trained weights are not yet published.
 
-The pin is asserted at build time: `build_config()` raises a named error if
-SAM 2 has moved underneath it.
+## Usage
 
-## Quick start
-
-Frames must arrive in capture order; memory carries across them. A shuffled
-folder won't error, it will just give you an incoherent result.
+Frames must be in capture order. Call `reset_memory()` between independent sequences.
 
 ```python
 import torch
-from sam_vtp import build_model
+from sam_vtp import CameraIntrinsics, build_model
 
-model = build_model("sam_vtp.pt", device=torch.device("cuda"))
+cam = CameraIntrinsics.from_K(K, width=848, height=480)  # native resolution
+model = build_model("sam_vtp.pt", device=torch.device("cuda"), camera=cam)
 
-model.reset_memory()                     # between independent sequences
+model.reset_memory()
 for t, (rgb, depth) in enumerate(stream):
-    out = model.forward_frame(rgb,       # (1,3,H,W) RGB in [0,255]
-                              is_init_frame=(t == 0),
-                              depth=depth)   # (1,1,H,W) planar z-depth, METRES
-    traversability = out["logits"].sigmoid()   # (1,1,H,W) in [0,1]
+    out = model.forward_frame(
+        rgb,                     # (1,3,H,W), RGB in [0,255]
+        is_init_frame=(t == 0),
+        depth=depth,             # (1,1,H,W), planar z-depth in metres
+    )
+    traversability = out["logits"].sigmoid()  # (1,1,H,W)
 ```
 
-A whole clip at once:
+For a clip, call `model(images, depth_sequence=depths)` with `(B,T,...)` tensors. `SAMVTPStreamProcessor` wraps the per-frame loop for live cameras.
 
-```python
-out = model(images, depth_sequence=depths)   # (B,T,...)
-```
-
-Command line:
+From the command line:
 
 ```bash
-sam-vtp-infer --images-dir frames/ --depth-dir depth/ \
-              --checkpoint sam_vtp.pt --output-dir predictions/ \
-              --height 512 --width 512
+sam-vtp-infer --images-dir frames/ --depth-dir depth/ --checkpoint sam_vtp.pt \
+              --output-dir predictions/ --height 512 --width 512
+sam-vtp-smoke --checkpoint sam_vtp.pt  # synthetic frames; prints the built configuration
 ```
 
-Writes `predictions/probability/*_prob.png` (continuous, 0-255) and
-`predictions/binary/*_bin.png` (thresholded, default 0.5). CUDA-graph replay is
-on by default when CUDA is available; `--no-fullgraph` turns it off.
-`sam-vtp-smoke --checkpoint sam_vtp.pt` runs a few synthetic frames and prints
-what the checkpoint actually built.
+`sam-vtp-infer` uses CUDA graph replay by default when CUDA is available; `--no-fullgraph` disables it.
 
-For a live camera, `SAMVTPStreamProcessor` does no camera I/O, just the loop:
+### Input conventions
 
-```python
-from sam_vtp import SAMVTPStreamProcessor
+Violating either of these produces a plausible but incorrect map, with no error.
 
-stream = SAMVTPStreamProcessor(model, resize_hw=(512, 512), threshold=0.5,
-                               input_fit="pad", return_numpy=True)
-while (frame := grab()) is not None:
-    result = stream.step(frame.rgb, depth=frame.depth)
-    if result.memory_fill_level < 1.0:
-        continue                       # bank still filling
-    plan(result.probabilities)         # (H, W) numpy array
-```
-
-See [`docs/integration.md`](docs/integration.md) for camera intrinsics,
-aspect-ratio fitting and memory cadence.
-
-## Component switches
-
-Three parts can be switched off at runtime:
-
-| Switch | Off means |
+| Input | Requirement |
 |---|---|
-| `memory` | every frame predicted from scratch, bank never read or written |
-| `geometry` | RGB only, no depth-derived feature |
-| `refine` | no residual refinement head |
+| Depth | Planar z-depth along the optical axis, in metres |
+| Intrinsics | Your camera's, at the calibrated resolution. The default is the TartanGround camera (640x640, 90° FOV) |
 
-```python
-model = build_model("sam_vtp.pt", device=dev, components={"memory": False})
-model.set_components(geometry=False)          # chainable, returns the model
+See [`docs/integration.md`](docs/integration.md) for aspect-ratio fitting, image range and memory cadence.
 
-with model.components(geometry=False):        # temporary, restored on exit
-    rgb_only = model.forward_frame(rgb, is_init_frame=True)
-```
-
-`--no-memory`, `--no-geometry` and `--no-refine` do the same on the CLI.
-
-A switch picks which of the checkpoint's weights are used. It cannot add a
-component the checkpoint lacks, and `set_components` raises instead of running an
-untrained module. Any deviation from the trained configuration shows up as
-`[ABLATED: ...]` in `describe(model)`.
-
-Switching after a CUDA graph is captured raises. The graph has the old
-configuration baked in.
-
-## Input conventions
-
-| Input | Requirement | If it's wrong |
-|---|---|---|
-| **Depth** | Planar z-depth along the optical axis, in **metres** | The geometry channels are metric. Millimetres are off by 1000x. |
-| **Intrinsics** | Yours, at the resolution they were calibrated at | The default is the TartanGround camera (640x640, 90 degree FOV). Wrong values tilt every slope. |
-| **Frame order** | Capture order, one sequence per `reset_memory()` | Memory carries across frames, so a shuffled folder gives an incoherent result rather than an error. |
-
-## How it works
+## Architecture
 
 <p align="center"><img src="docs/architecture.png" width="100%" alt="SAM-VTP architecture"></p>
 
-RGB and depth are encoded and summed, fused with the memory bank by memory
-attention, then given a residual correction from full-resolution RGB before
-being written back. Starred blocks are what SAM-VTP adds on top of SAM 2.
+For each frame (41.2 M parameters in total):
 
-Per frame, in `modeling/sam_vtp.py`:
+1. **Image encoder:** Hiera-T with an FPN, from SAM 2, giving features at strides 4, 8 and 16.
+2. **Geometry encoder (128 k):** log-depth, slope, roughness, height and validity, added to the stride-16 features through a zero-initialised gate.
+3. **Memory attention:** conditions those features on a 7-frame bank.
+4. **Mask decoder:** predicts logits under a fixed learned prompt, which replaces SAM 2's prompt encoder.
+5. **Refinement head (905):** adds a residual from full-resolution RGB.
+6. **Memory encoder:** writes the features and prediction back to the bank.
 
-1. **Image encoder** (Hiera-T + FPN, from SAM 2) gives features at strides 4, 8
-   and 16.
-2. **Geometry** (optional) turns depth into log-depth, slope, roughness, height
-   and validity, added to the stride-16 level through a zero-initialised gate.
-3. **Memory attention** conditions those features on a 7-slot bank.
-4. **Mask decoder** produces logits under a fixed learned prompt.
-5. **Refinement head** adds a residual from full-resolution RGB.
-6. **Memory encoder** writes (features, prediction) back into the bank.
+Checkpoints load strictly, and the architecture is read from the weights. SAM 2 checkpoints are not compatible.
 
-| Component | Parameters |
-|---|---:|
-| Image encoder (Hiera-T + FPN) | 27.2 M |
-| Memory attention | 5.9 M |
-| Mask decoder | 4.2 M |
-| Learned prompt | 2.1 M |
-| Memory encoder | 1.4 M |
-| Geometry encoder | 127.6 k |
-| Refinement head | 905 |
-| **Total** | **41.2 M** |
+### Differences from SAM 2
 
-### Where this diverges from SAM 2
+`SAMVTPBase` overrides SAM 2's frame loop. Each difference is marked `DIVERGENCE n` in the source:
 
-Six differences, each marked `DIVERGENCE n` in the source. Each one changes the
-numbers, which is why `SAMVTPBase` overrides SAM 2's frame loop instead of
-calling it.
-
-| # | Divergence | Where |
+| # | Change | File |
 |---|---|---|
-| 1 | `no_mem_embed` is written back into `vision_feats`, so the conditioning frame's *stored* memory includes it | `sam_vtp.py` |
-| 2 | `object_score_logits` comes from the prediction itself, not from `pred_obj_score_head` | `sam_vtp.py` |
-| 3 | The object-pointer horizon is clamped by frames actually *seen*, not by clip length, which is unknown when streaming | `sam_vtp_base.py` |
-| 4 | Memory slot selection at unit stride, and the learned prompt is resampled to the running feature grid | `sam_vtp_base.py`, `sam_vtp.py` |
-| 5 | The mask is upsampled to the **input** size, not `image_size`, switching to bicubic at scale >= 3 | `sam_vtp.py` |
-| 6 | `_prepare_backbone_features` returns four values in SAM 2; the first is discarded | `sam_vtp.py` |
+| 1 | `no_mem_embed` is written back into `vision_feats`, so the conditioning frame's stored memory includes it | `sam_vtp.py` |
+| 2 | `object_score_logits` comes from the prediction, not `pred_obj_score_head` | `sam_vtp.py` |
+| 3 | The object-pointer horizon is clamped by frames seen, not clip length | `sam_vtp_base.py` |
+| 4 | Memory slots are selected at unit stride, and the learned prompt is resampled to the feature grid | `sam_vtp_base.py`, `sam_vtp.py` |
+| 5 | Masks are upsampled to the input size, not `image_size`, using bicubic at scale >= 3 | `sam_vtp.py` |
+| 6 | The first return value of `_prepare_backbone_features` is discarded | `sam_vtp.py` |
 
-**The prompt is learned, not clicked.** SAM 2 is interactive. Here the target is
-always "ground this platform can drive on", so the prompt is fixed and learned
-during training. Point coordinates are accepted and ignored. A checkpoint
-carrying SAM 2's `point_embeddings` or `mask_downscaling` weights will not load.
+### Ablation
 
-**Checkpoints load strictly.** The architecture is read back from the weights
-rather than from flags, and `build_model` raises on any missing or unexpected
-key.
+Memory, geometry and refinement can be disabled at runtime. This selects among the checkpoint's existing weights without retraining, and `describe(model)` reports the result as ablated.
+
+```python
+model = build_model("sam_vtp.pt", device=dev, components={"memory": False})
+
+with model.components(geometry=False):
+    out = model.forward_frame(rgb, is_init_frame=True)
+```
+
+The CLI equivalents are `--no-memory`, `--no-geometry` and `--no-refine`.
 
 ## Label generation
 
-The training target is generated, not hand-annotated:
+Training targets are generated from simulator depth and semantics:
 
 ```
-y = semantic_prior(class) x slope_factor x roughness_factor x height_gate
+y = semantic_prior(class) * slope_factor * roughness_factor * height_gate
 ```
 
 ```bash
 sam-vtp-labels --root /data/tartanground --workers 24
 ```
 
-See [`docs/labels.md`](docs/labels.md) for the taxonomy and the geometry.
+See [`docs/labels.md`](docs/labels.md).
 
-## Layout
+## Repository layout
 
 ```
-third_party/sam2/       pinned SAM 2 submodule (Apache 2.0, not vendored)
+third_party/sam2/       pinned SAM 2 submodule
 src/sam_vtp/
-  build.py              config assembly, asserts the SAM 2 pin
-  checkpoint.py         checkpoint reading, architecture inferred from weights
-  modeling/
-    sam_vtp.py          the frame loop; divergences 1, 2, 5, 6
-    sam_vtp_base.py     SAM2Base subclass; divergences 3, 4
-    patches.py          cached Hiera, position encoding, RoPE attention
-    geometry.py         intrinsics, depth-derived channels, geometry encoder
-    prompt.py           the fixed learned prompt
-    refine.py           full-resolution RGB residual head
-  configs/              delta YAML layered over SAM 2's config
-  inference.py          sequence inference, depth loading
-  stream.py             camera-agnostic streaming loop
-  fullgraph.py          optional CUDA-graph replay of the forward pass
-  cli.py, smoke.py      entry points
-  labels/               taxonomy.py, generate.py
-tests/
-  check_fullgraph.py    CUDA-graph replay vs the eager path
-  check_cadence.py      memory-write cadence gate (CPU only, no checkpoint)
-scripts/
-  infer_sequence.py, smoke_test.py   run without installing the package
+  build.py              config assembly; asserts the SAM 2 pin
+  checkpoint.py         checkpoint reading
+  modeling/             frame loop, geometry, prompt, refinement, SAM 2 patches
+  configs/              delta YAML over SAM 2's config
+  inference.py          sequence inference and depth loading
+  stream.py             streaming loop
+  fullgraph.py          CUDA graph replay of the forward pass
+  labels/               label pipeline
+tests/                  graph-replay and memory-cadence checks
+scripts/                inference and smoke test without installing
 ```
 
-Run `tests/check_fullgraph.py` after changing `modeling/sam_vtp.py`.
-`fullgraph.py` reimplements the forward pass and is what runs by default on
-CUDA, so the two drift apart silently.
+`fullgraph.py` reimplements the forward pass and is the default on CUDA. Run `tests/check_fullgraph.py` after changing `modeling/sam_vtp.py`.
 
 ## Citation
 
 ```bibtex
-[TBD]
+@misc{hoefs2026samvtp,
+  title  = {{SAM-VTP}: Video Memory and Measured Geometry for Continuous Traversability Segmentation},
+  author = {Hoefs, Lucas and Xie, Hui and An, Senjian and Zhang, Fangyi},
+  year   = {2026}
+}
 ```
 
 ## License
 
-MIT, see `LICENSE`. Depends on SAM 2 (Apache 2.0) as a submodule and subclasses
-several of its modules. See `NOTICE`.
+MIT. SAM 2 is used as a submodule under Apache 2.0; see `NOTICE`.
