@@ -18,7 +18,12 @@ pip install -e .            # model and inference
 pip install -e ".[labels]"  # adds the label pipeline (OpenCV)
 ```
 
-Trained weights are not yet published.
+Trained weights are on [Hugging Face](https://huggingface.co/lucashoefs/sam-vtp):
+
+```bash
+pip install huggingface_hub
+hf download lucashoefs/sam-vtp sam_vtp.pt --local-dir .
+```
 
 ## Usage
 
@@ -140,13 +145,7 @@ scripts/                inference and smoke test without installing
 
 ## Citation
 
-```bibtex
-@misc{hoefs2026samvtp,
-  title  = {{SAM-VTP}: Video Memory and Measured Geometry for Continuous Traversability Segmentation},
-  author = {Hoefs, Lucas and Xie, Hui and An, Senjian and Zhang, Fangyi},
-  year   = {2026}
-}
-```
+TBD
 
 ## License
 
